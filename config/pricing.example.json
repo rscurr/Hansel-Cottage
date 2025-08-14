@@ -1,0 +1,28 @@
+{
+  "currency": "GBP",
+  "minStayDefault": 2,
+  "dogFee": {
+    "type": "flat",
+    "amount": 60,
+    "per": "booking"
+  },
+  "changeoverDay": "",
+  "seasons": [
+    {
+      "name": "Low",
+      "start": "2025-01-06",
+      "end": "2025-03-21",
+      "nightly": 150,
+      "weekly": 900,
+      "minStay": 2
+    },
+    {
+      "name": "High",
+      "start": "2025-07-01",
+      "end": "2025-08-31",
+      "nightly": 220,
+      "weekly": 1400,
+      "minStay": 7
+    }
+  ]
+}
