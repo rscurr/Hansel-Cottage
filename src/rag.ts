@@ -1,150 +1,126 @@
-import axios from 'axios';
-import cheerio from 'cheerio';
+// Minimal RAG engine with keyword ranking and optional LLM phrasing.
+// Add external documents (PDFs) via addExternalDocumentToIndex().
+// If OPENAI_API_KEY is present, answers are nicely phrased with context;
+// otherwise returns helpful snippets.
 
-type Chunk = { url: string; text: string; embedding?: number[] };
-let chunks: Chunk[] = [];
-let lastCrawl = 0;
-
-const BASE_URLS = (process.env.BASE_URLS || '').split(',').map(s => s.trim()).filter(Boolean);
-const REFRESH_INTERVAL_MINUTES = Number(process.env.REFRESH_INTERVAL_MINUTES || '60');
 const OPENAI_API_KEY = process.env.OPENAI_API_KEY || '';
 
-function textify(html: string) {
-  const $ = cheerio.load(html);
-  ['script','style','noscript','iframe','svg'].forEach(s => $(s).remove());
-  const body = $('body').text().replace(/\s+/g, ' ').trim();
-  return body;
+export type Chunk = { id: string; url: string; text: string; embedding?: number[] };
+
+// Keep chunks in-memory across hot reloads (Render container lifetime)
+export const chunks: Chunk[] = (global as any).__HC_CHUNKS__ ||= [];
+
+// No-op placeholder; wire your site crawler here if you have one.
+export async function refreshContentIndex(force = false) {
+  if (force) {
+    // In a real crawler, you'd refresh site pages into `chunks` here.
+    console.log('[rag] refresh requested (no-op placeholder)');
+  }
 }
 
-async function crawlOnce() {
+// --- Chunking helpers ---
+function cryptoId() {
+  return Math.random().toString(36).slice(2) + Date.now().toString(36);
+}
+
+// Split text at paragraph boundaries to ~1000 chars
+function splitIntoChunks(text: string, sourceUrl: string, maxLen = 1000): Chunk[] {
+  const paras = text.split(/\n{2,}/g).map(s => s.trim()).filter(Boolean);
   const out: Chunk[] = [];
-  const seen = new Set<string>();
-  const queue = [...BASE_URLS];
-
-  const sameOrigin = (base: string, url: string) => {
-    try {
-      const a = new URL(url, base);
-      const b = new URL(base);
-      return a.hostname === b.hostname;
-    } catch { return false; }
-  };
-
-  while (queue.length > 0 && out.length < 200) {
-    const url = queue.shift() as string;
-    if (seen.has(url)) continue;
-    seen.add(url);
-
-    try {
-      const res = await axios.get(url, { timeout: 10000 });
-      const html = res.data as string;
-      const text = textify(html);
-      if (text.length > 100) {
-        const size = 1200;
-        for (let i = 0; i < text.length; i += size) {
-          out.push({ url, text: text.slice(i, i + size) });
-        }
-      }
-      const $ = cheerio.load(res.data);
-      $('a[href]').each((_i, el) => {
-        const href = ($(el).attr('href') || '').trim();
-        if (!href) return;
-        const next = new URL(href, url).toString();
-        if (sameOrigin(url, next) && !seen.has(next) && queue.length < 200) queue.push(next);
-      });
-    } catch {
-      // ignore fetch errors per-page
+  let buf = '';
+  for (const p of paras) {
+    if ((buf + '\n\n' + p).length > maxLen && buf) {
+      out.push({ id: cryptoId(), url: sourceUrl, text: buf });
+      buf = p;
+    } else {
+      buf = buf ? buf + '\n\n' + p : p;
     }
   }
-  chunks = out;
+  if (buf) out.push({ id: cryptoId(), url: sourceUrl, text: buf });
+  return out;
 }
 
-async function embedAll() {
-  if (!OPENAI_API_KEY) return;
-  for (const c of chunks) {
-    c.embedding = await embedText(c.text);
+// --- Public: add external document (e.g., PDF) into index ---
+export async function addExternalDocumentToIndex(title: string, sourceUrl: string, text: string) {
+  const newChunks = splitIntoChunks(text, sourceUrl);
+  // Optional: embed chunks (not required for keyword search)
+  if (OPENAI_API_KEY) {
+    try {
+      const res = await fetch('https://api.openai.com/v1/embeddings', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json', 'Authorization': `Bearer ${OPENAI_API_KEY}` },
+        body: JSON.stringify({ model: 'text-embedding-3-small', input: newChunks.map(c => c.text) })
+      });
+      if (res.ok) {
+        const j = await res.json();
+        j.data.forEach((row: any, i: number) => { newChunks[i].embedding = row.embedding; });
+      }
+    } catch {
+      // Ignore embedding failures; keyword search still works.
+    }
+  }
+  chunks.push(...newChunks);
+  return { added: newChunks.length, title, sourceUrl };
+}
+
+// Convenience wrapper if you want to keep the name parity
+export async function addPdfByUrlToIndex(name: string, pdfUrl: string, fetcher: (u: string)=>Promise<string>) {
+  const text = await fetcher(pdfUrl);
+  return addExternalDocumentToIndex(name, pdfUrl, text);
+}
+
+// --- Retrieval & answer ---
+function keywordRank(query: string, k = 6): Chunk[] {
+  const terms = query.toLowerCase().split(/\W+/).filter(Boolean);
+  const score = (t: string) => terms.reduce((s, w) => s + (t.toLowerCase().includes(w) ? 1 : 0), 0);
+  return chunks
+    .map(c => ({ c, s: score(c.text) }))
+    .sort((a, b) => b.s - a.s)
+    .slice(0, k)
+    .map(x => x.c);
+}
+
+async function chatWithContext(prompt: string, context: string): Promise<string> {
+  if (!OPENAI_API_KEY) return '';
+  try {
+    const res = await fetch('https://api.openai.com/v1/chat/completions', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json', 'Authorization': `Bearer ${OPENAI_API_KEY}` },
+      body: JSON.stringify({
+        model: 'gpt-4o-mini',
+        temperature: 0.2,
+        messages: [
+          { role: 'system', content: 'You are a helpful holiday-cottage assistant. Answer using ONLY the provided context. If the answer is not in context, say you do not know.' },
+          { role: 'user', content: `Context:\n${context}\n\nQuestion: ${prompt}` }
+        ]
+      })
+    });
+    if (!res.ok) throw new Error(String(await res.text()));
+    const j = await res.json();
+    return j.choices?.[0]?.message?.content || '';
+  } catch {
+    return '';
   }
 }
 
-export async function refreshContentIndex(force = false) {
-  const due = Date.now() - lastCrawl > REFRESH_INTERVAL_MINUTES * 60_000;
-  if (!force && !due) return;
-  if (BASE_URLS.length === 0) {
-    console.warn('BASE_URLS not set; chat answers will be limited.');
-    chunks = [];
-    lastCrawl = Date.now();
-    return;
-  }
-  await crawlOnce();
-  await embedAll();
-  lastCrawl = Date.now();
-  console.log(`Crawl complete. ${chunks.length} chunks indexed.`);
-}
-
-function cosine(a: number[], b: number[]) {
-  let dot = 0, na = 0, nb = 0;
-  for (let i = 0; i < a.length; i++) { dot += a[i]*b[i]; na += a[i]*a[i]; nb += b[i]*b[i]; }
-  return dot / (Math.sqrt(na) * Math.sqrt(nb) + 1e-9);
-}
-
-async function embedText(text: string): Promise<number[]> {
-  const res = await fetch('https://api.openai.com/v1/embeddings', {
-    method: 'POST',
-    headers: { 'Content-Type':'application/json', 'Authorization': `Bearer ${OPENAI_API_KEY}` },
-    body: JSON.stringify({ model: 'text-embedding-3-small', input: text })
-  });
-  if (!res.ok) throw new Error(`embedding failed: ${res.status}`);
-  const j = await res.json();
-  return j.data[0].embedding as number[];
-}
-
-async function chatWithContext(prompt: string, context: string) {
-  const res = await fetch('https://api.openai.com/v1/chat/completions', {
-    method: 'POST',
-    headers: { 'Content-Type':'application/json', 'Authorization': `Bearer ${OPENAI_API_KEY}` },
-    body: JSON.stringify({
-      model: 'gpt-4o-mini',
-      messages: [
-        { role: 'system', content: 'You are a lodging assistant. Answer using ONLY the provided context. If the answer is not in context, say you do not know.' },
-        { role: 'user', content: `Context:\n${context}\n\nQuestion: ${prompt}` }
-      ],
-      temperature: 0.2
-    })
-  });
-  if (!res.ok) throw new Error(`chat failed: ${res.status}`);
-  const j = await res.json();
-  const text = j.choices?.[0]?.message?.content || 'No answer';
-  return text;
-}
-
-export async function answerWithContext(message: string) {
-  if (chunks.length === 0) await refreshContentIndex(true);
-  const OPENAI = !!OPENAI_API_KEY;
-
-  let top: Chunk[] = [];
-  if (OPENAI && chunks[0]?.embedding) {
-    const qvec = await embedText(message);
-    top = chunks
-      .map(c => ({ c, score: cosine(qvec, c.embedding as number[]) }))
-      .sort((a,b) => b.score - a.score)
-      .slice(0, 6)
-      .map(x => x.c);
-  } else {
-    const terms = message.toLowerCase().split(/\W+/).filter(Boolean);
-    const score = (t: string) => terms.reduce((s, w) => s + (t.toLowerCase().includes(w) ? 1 : 0), 0);
-    top = chunks
-      .map(c => ({ c, s: score(c.text) }))
-      .sort((a,b) => b.s - a.s).slice(0, 6)
-      .map(x => x.c);
+export async function answerWithContext(message: string, useOpenAI: boolean = !!OPENAI_API_KEY) {
+  if (chunks.length === 0) {
+    console.log('[rag] no chunks loaded; returning empty snippets fallback');
   }
 
-  const context = top.map(t => `From ${t.url}:\n${t.text}`).join('\n---\n');
-  if (!OPENAI) {
-    return {
-      answer: "LLM disabled. Here are the most relevant snippets from your site.",
-      context: top.map(t => ({ url: t.url, snippet: t.text.slice(0, 500) }))
-    };
-  } else {
-    const text = await chatWithContext(message, context);
-    return { answer: text, sources: [...new Set(top.map(t => t.url))] };
+  const top = keywordRank(message, 6);
+  const contextBlocks = top.map(t => `From ${t.url}:\n${t.text}`).join('\n---\n');
+
+  if (useOpenAI) {
+    const txt = await chatWithContext(message, contextBlocks);
+    if (txt) {
+      return { answer: txt, sources: [...new Set(top.map(t => t.url))] };
+    }
   }
+
+  // Snippet-only fallback (no LLM)
+  return {
+    answer: "Here are the most relevant details I found on the site.",
+    context: top.map(t => ({ url: t.url, snippet: t.text.slice(0, 500) }))
+  };
 }
