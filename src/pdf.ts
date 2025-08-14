@@ -1,6 +1,6 @@
 import pdfParse from 'pdf-parse';
 
-// Fetch a PDF by URL and return its text
+// Fetch a PDF by URL and return plain text
 export async function extractPdfTextFromUrl(url: string): Promise<string> {
   const res = await fetch(url);
   if (!res.ok) throw new Error(`Failed to fetch PDF: ${res.status} ${res.statusText}`);
