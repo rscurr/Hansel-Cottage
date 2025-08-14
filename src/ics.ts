@@ -1,5 +1,5 @@
 // src/ics.ts
-import * as ical from 'node-ical';
+import ical from 'node-ical';
 import { addDays, isBefore, isAfter, parseISO } from 'date-fns';
 
 type Booking = { start: string; end: string; summary?: string };
@@ -19,17 +19,38 @@ export async function refreshIcs(force = false) {
     return;
   }
   try {
-    const data = await ical.async.fromURL(ICS_URL);
+    let data: Record<string, any> | null = null;
+
+    // Preferred: built-in fetcher (when available)
+    try {
+      // @ts-ignore - .async may not be typed
+      if (ical?.async?.fromURL) {
+        // @ts-ignore
+        data = await ical.async.fromURL(ICS_URL);
+      }
+    } catch (e) {
+      console.warn('[ics] async.fromURL failed, will fetch manually:', (e as any)?.message || e);
+    }
+
+    // Fallback: fetch text, then parse
+    if (!data) {
+      const res = await fetch(ICS_URL);
+      if (!res.ok) throw new Error(`ICS fetch failed: ${res.status} ${res.statusText}`);
+      const text = await res.text();
+      // node-ical exposes parseICS synchronously on default export
+      // @ts-ignore
+      data = ical.parseICS(text);
+    }
+
     const out: Booking[] = [];
     for (const k of Object.keys(data)) {
-      const ev = data[k] as any;
+      const ev = (data as any)[k];
       if (!ev || ev.type !== 'VEVENT') continue;
       if (!ev.start || !ev.end) continue;
       const startISO = toIso(ev.start);
       const endISO = toIso(ev.end);
       out.push({ start: startISO, end: endISO, summary: ev.summary });
     }
-    // Sort + store
     out.sort((a, b) => a.start.localeCompare(b.start));
     bookings = out;
     lastRefresh = new Date().toISOString();
@@ -48,28 +69,22 @@ function toIso(d: Date | string): string {
 export function isRangeAvailable(fromISO: string, nights: number): boolean {
   const start = parseISO(fromISO);
   const end = addDays(start, nights);
-
   for (const b of bookings) {
     const bStart = parseISO(b.start);
     const bEnd = parseISO(b.end);
-    // Overlap if start < bEnd AND end > bStart
-    const overlaps = isBefore(start, bEnd) && isAfter(end, bStart);
-    if (overlaps) return false;
+    // overlap if start < bEnd AND end > bStart
+    if (isBefore(start, bEnd) && isAfter(end, bStart)) return false;
   }
   return true;
 }
 
 export function suggestAlternatives(fromISO: string, nights: number, max = 10) {
   const suggestions: Array<{ from: string; nights: number }> = [];
-  const start = parseISO(fromISO);
-
-  // Try the next 60 days for an open stretch
+  const base = parseISO(fromISO);
   for (let i = 1; i <= 60 && suggestions.length < max; i++) {
-    const candStart = addDays(start, i);
-    const candISO = toIso(candStart as any);
-    if (isRangeAvailable(candISO, nights)) {
-      suggestions.push({ from: candISO, nights });
-    }
+    const cand = addDays(base, i);
+    const candISO = cand.toISOString().slice(0, 10);
+    if (isRangeAvailable(candISO, nights)) suggestions.push({ from: candISO, nights });
   }
   return suggestions;
 }
