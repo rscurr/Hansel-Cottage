@@ -1,5 +1,6 @@
 import 'dotenv/config';
 import express from 'express';
+import path from 'node:path';
 import cors from 'cors';
 import { z } from 'zod';
 
