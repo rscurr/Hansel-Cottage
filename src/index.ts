@@ -1,4 +1,3 @@
-// src/index.ts
 import 'dotenv/config';
 import express from 'express';
 import cors from 'cors';
@@ -7,8 +6,12 @@ import { z } from 'zod';
 
 import { refreshIcs, isRangeAvailable, suggestAlternatives, getIcsStats } from './ics.js';
 import { quoteForStay } from './pricing.js';
-import { answerWithContext, refreshContentIndex, addExternalDocumentToIndex } from './rag.js';
-import { extractPdfTextFromUrl } from './pdf.js';
+import {
+  answerWithContext,
+  refreshContentIndex,
+  addExternalDocumentToIndex
+} from './rag.js';
+import { extractPdfTextFromUrl, extractPdfTextFromFile } from './pdf.js';
 import { interpretMessageWithLLM } from './nlp.js';
 
 const app = express();
@@ -21,30 +24,9 @@ const allowed = (process.env.ALLOWED_ORIGIN || '')
   .filter(Boolean);
 app.use(cors({ origin: allowed.length ? allowed : true }));
 
-/* ---------- Static ---------- */
+/* ---------- Static (widget, PDFs, etc.) ---------- */
 const publicDir = path.resolve(process.cwd(), 'public');
 app.use(express.static(publicDir));
-
-/* ---------- Boot tasks ---------- */
-refreshIcs().catch(e => console.error('[ics] init error', e));
-refreshContentIndex().catch(e => console.error('[rag] init error', e));
-
-(async () => {
-  const urls = (process.env.PDF_URLS || '')
-    .split(',')
-    .map(s => s.trim())
-    .filter(Boolean);
-
-  for (const u of urls) {
-    try {
-      const text = await extractPdfTextFromUrl(u);
-      await addExternalDocumentToIndex('PDF', u, text);
-      console.log('[pdf] indexed on boot:', u);
-    } catch (e) {
-      console.error('[pdf] boot ingest failed:', u, e);
-    }
-  }
-})();
 
 /* ---------- Health ---------- */
 app.get('/health', (_req, res) => {
@@ -56,12 +38,11 @@ app.get('/health', (_req, res) => {
   });
 });
 
-/* ---------- Availability API ---------- */
+/* ---------- Availability ---------- */
 const AvailQuery = z.object({
   from: z.string().regex(/^\d{4}-\d{2}-\d{2}$/),
   nights: z.coerce.number().int().min(1).max(30)
 });
-
 app.get('/api/availability', (req, res) => {
   const parsed = AvailQuery.safeParse(req.query);
   if (!parsed.success) return res.status(400).json({ error: parsed.error.flatten() });
@@ -73,22 +54,20 @@ app.get('/api/availability', (req, res) => {
   res.json({ available, reasons, suggestions });
 });
 
-/* ---------- Quote API ---------- */
+/* ---------- Quote ---------- */
 const QuoteReq = z.object({
   from: z.string().regex(/^\d{4}-\d{2}-\d{2}$/),
   nights: z.number().int().min(1).max(30),
   dogs: z.number().int().min(0).max(4).default(0)
 });
-
 app.post('/api/quote', (req, res) => {
   const parsed = QuoteReq.safeParse(req.body);
   if (!parsed.success) return res.status(400).json({ error: parsed.error.flatten() });
   res.json(quoteForStay(parsed.data));
 });
 
-/* ---------- Chat API ---------- */
+/* ---------- Chat ---------- */
 const ChatReq = z.object({ message: z.string().min(1).max(2000) });
-
 app.post('/api/chat', async (req, res) => {
   const parsed = ChatReq.safeParse(req.body);
   if (!parsed.success) return res.status(400).json({ error: parsed.error.flatten() });
@@ -105,8 +84,9 @@ app.post('/api/chat', async (req, res) => {
           nights: intent.nights,
           dogs: intent.dogs
         });
+        const dogsText = intent.dogs ? ` (incl. ${intent.dogs} dog${intent.dogs > 1 ? 's' : ''})` : '';
         return res.json({
-          answer: `✅ Available from ${intent.from} for ${intent.nights} nights. Total: ${quote.currency} ${quote.total}`
+          answer: `✅ Yes, it looks available from ${intent.from} for ${intent.nights} night(s). Estimated total: ${quote.currency} ${quote.total}${dogsText}.`
         });
       } else {
         const alts = suggestAlternatives(intent.from, intent.nights, 10)
@@ -114,23 +94,26 @@ app.post('/api/chat', async (req, res) => {
           .map(a => a.from)
           .join(', ');
         return res.json({
-          answer: `❌ Not available. Alternatives: ${alts || 'none found'}.`
+          answer: `❌ Sorry, those dates look unavailable.${alts ? ` Closest alternatives: ${alts}.` : ''}`
         });
       }
     }
   } catch (e) {
-    console.warn('[chat] LLM extract failed — fallback to RAG');
+    console.warn('[chat] LLM extract failed/limited — falling back to RAG:', (e as any)?.message || e);
   }
 
   try {
     const ans = await answerWithContext(message);
     return res.json(ans);
-  } catch (e) {
-    return res.json({ answer: 'I had trouble contacting the AI service. Please try again later.' });
+  } catch {
+    return res.json({
+      answer:
+        "I couldn’t reach the AI service just now. You can ask like ‘from YYYY-MM-DD for N nights with D dogs’, or try again shortly."
+    });
   }
 });
 
-/* ---------- Admin endpoints ---------- */
+/* ---------- Admin ---------- */
 app.post('/admin/ics/refresh', async (req, res) => {
   if (req.headers['x-admin-token'] !== process.env.ADMIN_TOKEN) {
     return res.status(401).json({ error: 'unauthorized' });
@@ -154,11 +137,17 @@ app.post('/admin/ingest-pdf', async (req, res) => {
   try {
     const url = String((req.body && (req.body.url || req.query.url)) || '');
     const name = String((req.body && (req.body.name || req.query.name)) || 'PDF');
-    if (!url || !/^https?:\/\//i.test(url)) {
-      return res.status(400).json({ error: 'Provide a valid PDF ?url=' });
+    if (!url) return res.status(400).json({ error: 'Provide a PDF url or relative filename in /public' });
+
+    let text: string;
+    if (/^https?:\/\//i.test(url)) {
+      console.log('[pdf ingest] fetching via HTTP:', url);
+      text = await extractPdfTextFromUrl(url);
+    } else {
+      const local = path.resolve(publicDir, url);
+      console.log('[pdf ingest] reading local file:', local);
+      text = await extractPdfTextFromFile(local);
     }
-    console.log('[pdf ingest] url received:', url); // ✅ Debugging aid
-    const text = await extractPdfTextFromUrl(url);
     const result = await addExternalDocumentToIndex(name, url, text);
     res.json({ ok: true, ...result });
   } catch (e: any) {
@@ -166,6 +155,42 @@ app.post('/admin/ingest-pdf', async (req, res) => {
   }
 });
 
-/* ---------- Start ---------- */
+/* ---------- Start & deferred boot tasks ---------- */
 const PORT = Number(process.env.PORT) || 3000;
-app.listen(PORT, () => console.log(`Server listening on :${PORT}`));
+app.listen(PORT, async () => {
+  console.log(`Server listening on :${PORT}`);
+
+  // Kick off non-blocking boot tasks AFTER we are listening.
+
+  // 1) RAG index (site, if any)
+  refreshContentIndex().catch(e => console.error('[rag] init error', e));
+
+  // 2) ICS refresh
+  refreshIcs().catch(e => console.error('[ics] init error', e));
+
+  // 3) PDF auto-ingest:
+  //    - If an entry in PDF_URLS looks like a full URL, fetch over HTTP(S).
+  //    - If it looks like "HouseInformation.pdf", read from local /public/HouseInformation.pdf.
+  const raw = (process.env.PDF_URLS || '')
+    .split(',')
+    .map(s => s.trim())
+    .filter(Boolean);
+
+  for (const entry of raw) {
+    try {
+      let text: string;
+      if (/^https?:\/\//i.test(entry)) {
+        console.log('[pdf boot] HTTP:', entry);
+        text = await extractPdfTextFromUrl(entry);
+      } else {
+        const local = path.resolve(publicDir, entry);
+        console.log('[pdf boot] LOCAL:', local);
+        text = await extractPdfTextFromFile(local);
+      }
+      await addExternalDocumentToIndex('PDF', entry, text);
+      console.log('[pdf boot] indexed:', entry);
+    } catch (e) {
+      console.error('[pdf] boot ingest failed:', entry, e);
+    }
+  }
+});
