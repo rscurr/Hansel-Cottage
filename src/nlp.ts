@@ -1,5 +1,5 @@
 // LLM-only booking intent extraction.
-// Returns { kind:'dates', from: 'YYYY-MM-DD', nights: number, dogs: number } or { kind:'none' }.
+// Returns { kind:'dates', from:'YYYY-MM-DD', nights:number, dogs:number } or { kind:'none' }.
 
 export type Intent =
   | { kind: 'dates'; from: string; nights: number; dogs: number }
@@ -22,7 +22,6 @@ export async function interpretMessageWithLLM(message: string): Promise<Intent> 
   if (!key) return { kind: 'none' };
 
   const todayISO = todayLondonISO();
-
   const body = {
     model: 'gpt-4o-mini',
     temperature: 0,
@@ -31,7 +30,7 @@ export async function interpretMessageWithLLM(message: string): Promise<Intent> 
       {
         role: 'system',
         content:
-`You extract booking details for a UK holiday cottage. 
+`You extract booking details for a UK holiday cottage.
 Output strict JSON like:
 {"from":"YYYY-MM-DD","nights":number,"dogs":number}
 Rules:
@@ -47,31 +46,26 @@ Only output JSON, no extra text.`
     ]
   };
 
-  try {
-    const res = await fetch('https://api.openai.com/v1/chat/completions', {
-      method: 'POST',
-      headers: { 'Content-Type': 'application/json', 'Authorization': `Bearer ${key}` },
-      body: JSON.stringify(body)
-    });
-    if (!res.ok) return { kind: 'none' };
-    const j = await res.json();
-    const raw = j.choices?.[0]?.message?.content;
-    if (!raw) return { kind: 'none' };
-    const parsed = JSON.parse(raw);
+  const res = await fetch('https://api.openai.com/v1/chat/completions', {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json', 'Authorization': `Bearer ${key}` },
+    body: JSON.stringify(body)
+  });
+  if (!res.ok) throw new Error(`chat failed: ${res.status}`);
+  const j = await res.json();
+  const raw = j.choices?.[0]?.message?.content;
+  if (!raw) return { kind: 'none' };
 
-    // Basic validation & clamping
+  try {
+    const parsed = JSON.parse(raw);
     if (
-      typeof parsed.from === 'string' &&
-      /^\d{4}-\d{2}-\d{2}$/.test(parsed.from) &&
-      typeof parsed.nights === 'number' &&
-      parsed.nights > 0
+      typeof parsed.from === 'string' && /^\d{4}-\d{2}-\d{2}$/.test(parsed.from) &&
+      typeof parsed.nights === 'number' && parsed.nights > 0
     ) {
       const nights = Math.min(Math.max(1, Math.round(parsed.nights)), 30);
       const dogs = Math.max(0, Math.min(4, Math.round(parsed.dogs || 0)));
       return { kind: 'dates', from: parsed.from, nights, dogs };
     }
-    return { kind: 'none' };
-  } catch {
-    return { kind: 'none' };
-  }
+  } catch { /* ignore */ }
+  return { kind: 'none' };
 }
