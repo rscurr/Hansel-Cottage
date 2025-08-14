@@ -1,12 +1,14 @@
 // src/pdf.ts
-// Extracts text from a PDF using Mozilla PDF.js (pdfjs-dist) without spawning a Web Worker.
-// This avoids the pdf-parse ENOENT issue and works in a plain Node server.
+// Extracts text from a PDF using Mozilla PDF.js (pdfjs-dist) without a worker.
+// Uses the legacy ESM build and light type shims so TypeScript is happy.
 
-import * as pdfjsLib from 'pdfjs-dist/legacy/build/pdf.js';
+/// <reference path="./types/pdfjs-dist.d.ts" />
+
+// Import the legacy ESM build (friendlier in Node)
+import * as pdfjsLib from 'pdfjs-dist/legacy/build/pdf.mjs';
 
 /**
  * Extract text from a PDF fetched from a URL.
- * @param url HTTP(S) URL to a PDF file
  */
 export async function extractPdfTextFromUrl(url: string): Promise<string> {
   if (!/^https?:\/\//i.test(url)) {
@@ -24,26 +26,27 @@ export async function extractPdfTextFromUrl(url: string): Promise<string> {
 
 /**
  * Extract text from a local PDF file (if you bundle one with the app).
- * @param path local filesystem path
  */
 export async function extractPdfTextFromFile(path: string): Promise<string> {
   const { readFile } = await import('node:fs/promises');
   const buf = await readFile(path);
-  return extractPdfTextFromArrayBuffer(buf.buffer.slice(buf.byteOffset, buf.byteOffset + buf.byteLength));
+
+  // Turn Node Buffer into a clean ArrayBuffer
+  const ab = buf.buffer.slice(buf.byteOffset, buf.byteOffset + buf.byteLength);
+  return extractPdfTextFromArrayBuffer(ab);
 }
 
 /* ---------------------- internals ---------------------- */
 
 /**
- * Core extractor that works directly from an ArrayBuffer.
- * Uses the legacy build and disables features that require a worker or canvas.
+ * Core extractor that works directly from an ArrayBuffer (or ArrayBufferLike).
+ * We avoid setting a worker in Node; the legacy build works inline.
  */
-async function extractPdfTextFromArrayBuffer(ab: ArrayBuffer): Promise<string> {
-  // In Node, we avoid the worker entirely by not setting GlobalWorkerOptions.workerSrc
-  // and by using safe flags below.
+async function extractPdfTextFromArrayBuffer(ab: ArrayBufferLike): Promise<string> {
+  // pdfjs-dist's getDocument accepts BufferSource; cast is fine here.
   const loadingTask = (pdfjsLib as any).getDocument({
-    data: ab,
-    // Be conservative in Node:
+    data: ab as ArrayBuffer,
+    // Conservative settings for server-side usage:
     useWorkerFetch: false,
     isEvalSupported: false,
     disableFontFace: true,
@@ -56,11 +59,15 @@ async function extractPdfTextFromArrayBuffer(ab: ArrayBuffer): Promise<string> {
     let text = '';
     for (let p = 1; p <= pdf.numPages; p++) {
       const page = await pdf.getPage(p);
-      const content = await page.getTextContent({ normalizeWhitespace: true, disableCombineTextItems: false });
-      // Concatenate all text items for this page; add blank line between pages
+      const content = await page.getTextContent({
+        normalizeWhitespace: true,
+        disableCombineTextItems: false
+      });
+
       const pageText = (content.items as any[])
-        .map((it: any) => (typeof it.str === 'string' ? it.str : ''))
+        .map((it: any) => (typeof it?.str === 'string' ? it.str : ''))
         .join(' ');
+
       text += pageText + '\n\n';
     }
     return normalizeWhitespace(text);
