@@ -3,26 +3,24 @@ import express from 'express';
 import cors from 'cors';
 import { z } from 'zod';
 
-// ✅ use the existing modules you have
 import { refreshIcs, isRangeAvailable, suggestAlternatives, getIcsStats } from './ics.js';
 import { quoteForStay } from './pricing.js';
 import { answerWithContext, refreshContentIndex } from './rag.js';
+import { interpretMessage } from './nlp.js';
 
 const app = express();
 app.use(express.json({ limit: '1mb' }));
 
-// CORS: allow your site origin (or comma-separated list)
+// CORS
 const allowed = (process.env.ALLOWED_ORIGIN || '').split(',').map(s => s.trim()).filter(Boolean);
-app.use(cors({
-  origin: allowed.length ? allowed : true,
-}));
+app.use(cors({ origin: allowed.length ? allowed : true }));
 
-// Serve the hosted widget script
+// Serve hosted widget
 app.use(express.static('public'));
 
-// --- Kick off background refreshes (non-blocking)
-refreshIcs().catch(err => console.error('ICS init error', err));
-refreshContentIndex().catch(err => console.error('Crawler init error', err));
+// Boot-time refreshes
+refreshIcs().catch(e => console.error('ICS init error', e));
+refreshContentIndex().catch(e => console.error('Crawler init error', e));
 
 // Health
 app.get('/health', (_req, res) => {
@@ -54,25 +52,47 @@ const QuoteReq = z.object({
 app.post('/api/quote', (req, res) => {
   const parsed = QuoteReq.safeParse(req.body);
   if (!parsed.success) return res.status(400).json({ error: parsed.error.flatten() });
-
   const result = quoteForStay(parsed.data);
   res.json(result);
 });
 
-// Chat (RAG over your site content)
+// Chat with smart booking intent
 const ChatReq = z.object({ message: z.string().min(1).max(2000) });
 app.post('/api/chat', async (req, res) => {
   const parsed = ChatReq.safeParse(req.body);
   if (!parsed.success) return res.status(400).json({ error: parsed.error.flatten() });
+
+  const { message } = parsed.data;
+
+  // 1) Try to interpret booking intent & answer deterministically
+  const intent = interpretMessage(message);
+  if (intent.kind === 'dates') {
+    const available = isRangeAvailable(intent.from, intent.nights);
+    if (available) {
+      const quote = quoteForStay({ from: intent.from, nights: intent.nights, dogs: intent.dogs });
+      const dogsText = intent.dogs ? ` (incl. ${intent.dogs} dog${intent.dogs>1?'s':''})` : '';
+      return res.json({
+        answer: `✅ Yes, it looks available from ${intent.from} for ${intent.nights} night(s). Estimated total: ${quote.currency} ${quote.total}${dogsText}.`
+      });
+    } else {
+      const alts = suggestAlternatives(intent.from, intent.nights, 10).slice(0,3).map(a => a.from).join(', ');
+      return res.json({
+        answer: `❌ Sorry, those dates look unavailable. ${alts ? `Closest alternatives: ${alts}.` : ''}`
+      });
+    }
+  }
+
+  // 2) Fallback to RAG/LLM over your site content
   try {
-    const answer = await answerWithContext(parsed.data.message);
-    res.json(answer);
+    const answer = await answerWithContext(message);
+    return res.json(answer);
   } catch (e: any) {
-    res.status(500).json({ error: e?.message || 'chat-error' });
+    console.error(e);
+    return res.status(500).json({ error: e?.message || 'chat-error' });
   }
 });
 
-// Admin: force ICS refresh (requires header X-Admin-Token)
+// Admin
 app.post('/admin/ics/refresh', async (req, res) => {
   if (req.headers['x-admin-token'] !== process.env.ADMIN_TOKEN) {
     return res.status(401).json({ error: 'unauthorized' });
@@ -84,8 +104,6 @@ app.post('/admin/ics/refresh', async (req, res) => {
     res.status(500).json({ error: e?.message || 'ics-refresh-error' });
   }
 });
-
-// Admin: force content reindex (requires header X-Admin-Token)
 app.post('/admin/reindex', async (req, res) => {
   if (req.headers['x-admin-token'] !== process.env.ADMIN_TOKEN) {
     return res.status(401).json({ error: 'unauthorized' });
@@ -99,6 +117,4 @@ app.post('/admin/reindex', async (req, res) => {
 });
 
 const PORT = Number(process.env.PORT) || 3000;
-app.listen(PORT, () => {
-  console.log(`Server listening on :${PORT}`);
-});
+app.listen(PORT, () => console.log(`Server listening on :${PORT}`));
