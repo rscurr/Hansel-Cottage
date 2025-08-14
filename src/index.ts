@@ -18,10 +18,7 @@ const app = express();
 app.use(express.json({ limit: '1mb' }));
 
 /* ---------- CORS ---------- */
-const allowed = (process.env.ALLOWED_ORIGIN || '')
-  .split(',')
-  .map(s => s.trim())
-  .filter(Boolean);
+const allowed = (process.env.ALLOWED_ORIGIN || '').split(',').map(s => s.trim()).filter(Boolean);
 app.use(cors({ origin: allowed.length ? allowed : true }));
 
 /* ---------- Static (widget, PDFs, etc.) ---------- */
@@ -79,23 +76,14 @@ app.post('/api/chat', async (req, res) => {
     if (intent.kind === 'dates') {
       const available = isRangeAvailable(intent.from, intent.nights);
       if (available) {
-        const quote = quoteForStay({
-          from: intent.from,
-          nights: intent.nights,
-          dogs: intent.dogs
-        });
+        const quote = quoteForStay({ from: intent.from, nights: intent.nights, dogs: intent.dogs });
         const dogsText = intent.dogs ? ` (incl. ${intent.dogs} dog${intent.dogs > 1 ? 's' : ''})` : '';
         return res.json({
           answer: `✅ Yes, it looks available from ${intent.from} for ${intent.nights} night(s). Estimated total: ${quote.currency} ${quote.total}${dogsText}.`
         });
       } else {
-        const alts = suggestAlternatives(intent.from, intent.nights, 10)
-          .slice(0, 3)
-          .map(a => a.from)
-          .join(', ');
-        return res.json({
-          answer: `❌ Sorry, those dates look unavailable.${alts ? ` Closest alternatives: ${alts}.` : ''}`
-        });
+        const alts = suggestAlternatives(intent.from, intent.nights, 10).slice(0, 3).map(a => a.from).join(', ');
+        return res.json({ answer: `❌ Sorry, those dates look unavailable.${alts ? ` Closest alternatives: ${alts}.` : ''}` });
       }
     }
   } catch (e) {
@@ -107,45 +95,46 @@ app.post('/api/chat', async (req, res) => {
     return res.json(ans);
   } catch {
     return res.json({
-      answer:
-        "I couldn’t reach the AI service just now. You can ask like ‘from YYYY-MM-DD for N nights with D dogs’, or try again shortly."
+      answer: "I couldn’t reach the AI service just now. You can ask like ‘from YYYY-MM-DD for N nights with D dogs’, or try again shortly."
     });
   }
 });
 
 /* ---------- Admin ---------- */
 app.post('/admin/ics/refresh', async (req, res) => {
-  if (req.headers['x-admin-token'] !== process.env.ADMIN_TOKEN) {
-    return res.status(401).json({ error: 'unauthorized' });
-  }
+  if (req.headers['x-admin-token'] !== process.env.ADMIN_TOKEN) return res.status(401).json({ error: 'unauthorized' });
   await refreshIcs(true);
   res.json({ ok: true, ics: getIcsStats?.() });
 });
 
 app.post('/admin/reindex', async (req, res) => {
-  if (req.headers['x-admin-token'] !== process.env.ADMIN_TOKEN) {
-    return res.status(401).json({ error: 'unauthorized' });
-  }
+  if (req.headers['x-admin-token'] !== process.env.ADMIN_TOKEN) return res.status(401).json({ error: 'unauthorized' });
   await refreshContentIndex(true);
   res.json({ ok: true });
 });
 
+function normalizePublicEntry(entry: string): string {
+  let e = entry.trim();
+  if (e.startsWith('/')) e = e.slice(1);
+  if (e.toLowerCase().startsWith('public/')) e = e.slice('public/'.length);
+  return e;
+}
+
 app.post('/admin/ingest-pdf', async (req, res) => {
-  if (req.headers['x-admin-token'] !== process.env.ADMIN_TOKEN) {
-    return res.status(401).json({ error: 'unauthorized' });
-  }
+  if (req.headers['x-admin-token'] !== process.env.ADMIN_TOKEN) return res.status(401).json({ error: 'unauthorized' });
   try {
-    const url = String((req.body && (req.body.url || req.query.url)) || '');
+    let url = String((req.body && (req.body.url || req.query.url)) || '');
     const name = String((req.body && (req.body.name || req.query.name)) || 'PDF');
     if (!url) return res.status(400).json({ error: 'Provide a PDF url or relative filename in /public' });
 
     let text: string;
     if (/^https?:\/\//i.test(url)) {
-      console.log('[pdf ingest] fetching via HTTP:', url);
+      console.log('[pdf ingest] HTTP:', url);
       text = await extractPdfTextFromUrl(url);
     } else {
+      url = normalizePublicEntry(url);
       const local = path.resolve(publicDir, url);
-      console.log('[pdf ingest] reading local file:', local);
+      console.log('[pdf ingest] LOCAL:', local);
       text = await extractPdfTextFromFile(local);
     }
     const result = await addExternalDocumentToIndex(name, url, text);
@@ -160,29 +149,18 @@ const PORT = Number(process.env.PORT) || 3000;
 app.listen(PORT, async () => {
   console.log(`Server listening on :${PORT}`);
 
-  // Kick off non-blocking boot tasks AFTER we are listening.
-
-  // 1) RAG index (site, if any)
   refreshContentIndex().catch(e => console.error('[rag] init error', e));
-
-  // 2) ICS refresh
   refreshIcs().catch(e => console.error('[ics] init error', e));
 
-  // 3) PDF auto-ingest:
-  //    - If an entry in PDF_URLS looks like a full URL, fetch over HTTP(S).
-  //    - If it looks like "HouseInformation.pdf", read from local /public/HouseInformation.pdf.
-  const raw = (process.env.PDF_URLS || '')
-    .split(',')
-    .map(s => s.trim())
-    .filter(Boolean);
-
-  for (const entry of raw) {
+  const raw = (process.env.PDF_URLS || '').split(',').map(s => s.trim()).filter(Boolean);
+  for (let entry of raw) {
     try {
       let text: string;
       if (/^https?:\/\//i.test(entry)) {
         console.log('[pdf boot] HTTP:', entry);
         text = await extractPdfTextFromUrl(entry);
       } else {
+        entry = normalizePublicEntry(entry);
         const local = path.resolve(publicDir, entry);
         console.log('[pdf boot] LOCAL:', local);
         text = await extractPdfTextFromFile(local);
