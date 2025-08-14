@@ -63,6 +63,28 @@ app.post('/api/quote', (req, res) => {
   res.json(quoteForStay(parsed.data));
 });
 
+/* ---------- Helper: decide if a message is about booking/availability ---------- */
+function isBookingLike(message: string): boolean {
+  const txt = message.toLowerCase();
+
+  // Fast path: obvious booking words
+  const bookingWords = [
+    'available', 'availability', 'book', 'booking', 'reserve', 'reservation',
+    'price', 'pricing', 'cost', 'quote', 'deposit',
+    'night', 'nights', 'week', 'weekend', 'dogs', 'dog',
+    'check-in', 'check in', 'checkout', 'check-out'
+  ];
+  if (bookingWords.some(w => txt.includes(w))) return true;
+
+  // Dates/ranges present?
+  if (/\b\d{4}-\d{2}-\d{2}\b/.test(txt)) return true;            // ISO date
+  if (/\bfrom\b.*\b(to|until)\b/.test(txt)) return true;         // "from X to/until Y"
+  if (/\bnext\s+(mon|tue|wed|thu|fri|sat|sun|monday|tuesday|wednesday|thursday|friday|saturday|sunday)\b/.test(txt)) return true;
+  if (/\bthis\s+(mon|tue|wed|thu|fri|sat|sun|monday|tuesday|wednesday|thursday|friday|saturday|sunday|weekend)\b/.test(txt)) return true;
+
+  return false;
+}
+
 /* ---------- Chat ---------- */
 const ChatReq = z.object({ message: z.string().min(1).max(2000) });
 app.post('/api/chat', async (req, res) => {
@@ -71,31 +93,39 @@ app.post('/api/chat', async (req, res) => {
 
   const message = parsed.data.message;
 
-  try {
-    const intent = await interpretMessageWithLLM(message);
-    if (intent.kind === 'dates') {
-      const available = isRangeAvailable(intent.from, intent.nights);
-      if (available) {
-        const quote = quoteForStay({ from: intent.from, nights: intent.nights, dogs: intent.dogs });
-        const dogsText = intent.dogs ? ` (incl. ${intent.dogs} dog${intent.dogs > 1 ? 's' : ''})` : '';
-        return res.json({
-          answer: `✅ Yes, it looks available from ${intent.from} for ${intent.nights} night(s). Estimated total: ${quote.currency} ${quote.total}${dogsText}.`
-        });
-      } else {
-        const alts = suggestAlternatives(intent.from, intent.nights, 10).slice(0, 3).map(a => a.from).join(', ');
-        return res.json({ answer: `❌ Sorry, those dates look unavailable.${alts ? ` Closest alternatives: ${alts}.` : ''}` });
+  // 💡 Only try date extraction + availability flow if the message looks booking-related.
+  if (isBookingLike(message)) {
+    try {
+      const intent = await interpretMessageWithLLM(message);
+      if (intent.kind === 'dates') {
+        const available = isRangeAvailable(intent.from, intent.nights);
+        if (available) {
+          const quote = quoteForStay({ from: intent.from, nights: intent.nights, dogs: intent.dogs });
+          const dogsText = intent.dogs ? ` (incl. ${intent.dogs} dog${intent.dogs > 1 ? 's' : ''})` : '';
+          return res.json({
+            answer: `✅ Yes, it looks available from ${intent.from} for ${intent.nights} night(s). Estimated total: ${quote.currency} ${quote.total}${dogsText}.`
+          });
+        } else {
+          const alts = suggestAlternatives(intent.from, intent.nights, 10).slice(0, 3).map(a => a.from).join(', ');
+          return res.json({
+            answer: `❌ Sorry, those dates look unavailable.${alts ? ` Closest alternatives: ${alts}.` : ''}`
+          });
+        }
       }
+      // If intent.kind !== 'dates', we’ll fall through to RAG below.
+    } catch (e) {
+      console.warn('[chat] LLM extract failed/limited — falling back to RAG:', (e as any)?.message || e);
     }
-  } catch (e) {
-    console.warn('[chat] LLM extract failed/limited — falling back to RAG:', (e as any)?.message || e);
   }
 
+  // 🔎 General questions → RAG (PDF/site). If OPENAI_API_KEY is set, this also phrases nicely.
   try {
     const ans = await answerWithContext(message);
     return res.json(ans);
   } catch {
     return res.json({
-      answer: "I couldn’t reach the AI service just now. You can ask like ‘from YYYY-MM-DD for N nights with D dogs’, or try again shortly."
+      answer:
+        "I couldn’t reach the AI service just now. You can ask like ‘from YYYY-MM-DD for N nights with D dogs’, or try again shortly."
     });
   }
 });
@@ -113,6 +143,7 @@ app.post('/admin/reindex', async (req, res) => {
   res.json({ ok: true });
 });
 
+// Normalize entries like "public/HouseInformation.pdf" → "HouseInformation.pdf"
 function normalizePublicEntry(entry: string): string {
   let e = entry.trim();
   if (e.startsWith('/')) e = e.slice(1);
