@@ -1,0 +1,22 @@
+# Optional Render blueprint (if you prefer IaC-style deploys)
+services:
+  - type: web
+    name: hanselcottage-chatbot-backend
+    env: node
+    plan: starter
+    buildCommand: "npm ci && npm run build"
+    startCommand: "npm start"
+    autoDeploy: true
+    envVars:
+      - key: ALLOWED_ORIGIN
+        value: https://www.hanselcottage.com
+      - key: BASE_URLS
+        value: https://www.hanselcottage.com/
+      - key: ICS_URL
+        sync: false
+      - key: OPENAI_API_KEY
+        sync: false
+      - key: ADMIN_TOKEN
+        generateValue: true
+      - key: REFRESH_INTERVAL_MINUTES
+        value: "60"
