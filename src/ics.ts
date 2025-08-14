@@ -1,5 +1,4 @@
-import ical from 'node-ical';
-import fetch from 'node-fetch';
+import * as ical from 'node-ical';
 import { addDays, parseISO } from 'date-fns';
 
 type Booking = { start: Date; end: Date };

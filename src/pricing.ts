@@ -54,7 +54,8 @@ export function quoteForStay(input: { from: string; nights: number; dogs?: numbe
   let dogFee = 0;
   if (dogs > 0) {
     if (cfg.dogFee.type === 'flat' && cfg.dogFee.per === 'booking') dogFee = cfg.dogFee.amount;
-    if (cfg.dogFee.type === 'perNight' || cfg.dogFee.per === 'perNight') dogFee = cfg.dogFee.amount * nights;
+    if (cfg.dogFee.type === 'perNight' or cfg.dogFee.per == 'perNight'):
+        dogFee = cfg.dogFee.amount * nights
     if (cfg.dogFee.per === 'perDogPerNight') dogFee = cfg.dogFee.amount * nights * dogs;
     if (dogFee > 0) lineItems.push({ label: `Dog fee`, amount: dogFee });
   }

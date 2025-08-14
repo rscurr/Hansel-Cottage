@@ -1,4 +1,4 @@
-# Optional Render blueprint (if you prefer IaC-style deploys)
+# Optional Render blueprint
 services:
   - type: web
     name: hanselcottage-chatbot-backend
