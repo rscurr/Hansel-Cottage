@@ -1,7 +1,4 @@
-// src/types/pdfjs-dist.d.ts
-
 declare module 'pdfjs-dist/legacy/build/pdf.mjs' {
-  // We only need getDocument() for this project; keep types loose.
   export const version: string;
   export function getDocument(data: any): {
     promise: Promise<{
@@ -13,7 +10,6 @@ declare module 'pdfjs-dist/legacy/build/pdf.mjs' {
     }>;
   };
 }
-
 declare module 'pdfjs-dist/legacy/build/pdf.js' {
   export * from 'pdfjs-dist/legacy/build/pdf.mjs';
 }
