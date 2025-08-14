@@ -6,7 +6,7 @@ let chunks: Chunk[] = [];
 let lastCrawl = 0;
 
 const BASE_URLS = (process.env.BASE_URLS || '').split(',').map(s => s.trim()).filter(Boolean);
-const REFRESH_INTERVAL_MINUTES = Number(process.env.RECTRESH_INTERVAL_MINUTES || '60');
+const REFRESH_INTERVAL_MINUTES = Number(process.env.REFRESH_INTERVAL_MINUTES || '60');
 const OPENAI_API_KEY = process.env.OPENAI_API_KEY || '';
 
 function textify(html: string) {
@@ -51,7 +51,7 @@ async function crawlOnce() {
         const next = new URL(href, url).toString();
         if (sameOrigin(url, next) && !seen.has(next) && queue.length < 200) queue.push(next);
       });
-    } catch (e) {
+    } catch {
       // ignore fetch errors per-page
     }
   }
@@ -66,7 +66,7 @@ async function embedAll() {
 }
 
 export async function refreshContentIndex(force = false) {
-  const due = Date.now() - lastCrawl > Number(process.env.REFRESH_INTERVAL_MINUTES || '60') * 60_000;
+  const due = Date.now() - lastCrawl > REFRESH_INTERVAL_MINUTES * 60_000;
   if (!force && !due) return;
   if (BASE_URLS.length === 0) {
     console.warn('BASE_URLS not set; chat answers will be limited.');
