@@ -1,17 +1,13 @@
+// src/index.ts
 import 'dotenv/config';
 import express from 'express';
 import cors from 'cors';
 import path from 'node:path';
 import { z } from 'zod';
 
-// Your local modules
 import { refreshIcs, isRangeAvailable, suggestAlternatives, getIcsStats } from './ics.js';
 import { quoteForStay } from './pricing.js';
-import {
-  answerWithContext,
-  refreshContentIndex,
-  addExternalDocumentToIndex
-} from './rag.js';
+import { answerWithContext, refreshContentIndex, addExternalDocumentToIndex } from './rag.js';
 import { extractPdfTextFromUrl } from './pdf.js';
 import { interpretMessageWithLLM } from './nlp.js';
 
@@ -25,16 +21,14 @@ const allowed = (process.env.ALLOWED_ORIGIN || '')
   .filter(Boolean);
 app.use(cors({ origin: allowed.length ? allowed : true }));
 
-/* ---------- Static assets (widget, PDFs, etc.) ---------- */
-// Use an absolute path so it works after TS compilation to dist/
+/* ---------- Static ---------- */
 const publicDir = path.resolve(process.cwd(), 'public');
 app.use(express.static(publicDir));
 
-/* ---------- Boot tasks (non-blocking) ---------- */
+/* ---------- Boot tasks ---------- */
 refreshIcs().catch(e => console.error('[ics] init error', e));
 refreshContentIndex().catch(e => console.error('[rag] init error', e));
 
-// Optional: auto-ingest one or more PDFs on boot via env PDF_URLS (comma-separated)
 (async () => {
   const urls = (process.env.PDF_URLS || '')
     .split(',')
@@ -62,7 +56,7 @@ app.get('/health', (_req, res) => {
   });
 });
 
-/* ---------- Availability (deterministic) ---------- */
+/* ---------- Availability API ---------- */
 const AvailQuery = z.object({
   from: z.string().regex(/^\d{4}-\d{2}-\d{2}$/),
   nights: z.coerce.number().int().min(1).max(30)
@@ -79,7 +73,7 @@ app.get('/api/availability', (req, res) => {
   res.json({ available, reasons, suggestions });
 });
 
-/* ---------- Quote (deterministic) ---------- */
+/* ---------- Quote API ---------- */
 const QuoteReq = z.object({
   from: z.string().regex(/^\d{4}-\d{2}-\d{2}$/),
   nights: z.number().int().min(1).max(30),
@@ -92,14 +86,7 @@ app.post('/api/quote', (req, res) => {
   res.json(quoteForStay(parsed.data));
 });
 
-/* ---------- Chat ---------- */
-/*
-  Flow:
-  1) Try LLM-only date extraction (1 OpenAI call). If it yields {from,nights,dogs}:
-     - Run deterministic availability + quote and reply.
-  2) Otherwise, answer via RAG (PDF/site context). If OPENAI_API_KEY is set, the answer is nicely phrased;
-     if not, it returns helpful snippets. Never throws 500 to the client.
-*/
+/* ---------- Chat API ---------- */
 const ChatReq = z.object({ message: z.string().min(1).max(2000) });
 
 app.post('/api/chat', async (req, res) => {
@@ -108,7 +95,6 @@ app.post('/api/chat', async (req, res) => {
 
   const message = parsed.data.message;
 
-  // Step 1: LLM date extraction → availability/quote
   try {
     const intent = await interpretMessageWithLLM(message);
     if (intent.kind === 'dates') {
@@ -119,11 +105,8 @@ app.post('/api/chat', async (req, res) => {
           nights: intent.nights,
           dogs: intent.dogs
         });
-        const dogsText = intent.dogs
-          ? ` (incl. ${intent.dogs} dog${intent.dogs > 1 ? 's' : ''})`
-          : '';
         return res.json({
-          answer: `✅ Yes, it looks available from ${intent.from} for ${intent.nights} night(s). Estimated total: ${quote.currency} ${quote.total}${dogsText}.`
+          answer: `✅ Available from ${intent.from} for ${intent.nights} nights. Total: ${quote.currency} ${quote.total}`
         });
       } else {
         const alts = suggestAlternatives(intent.from, intent.nights, 10)
@@ -131,55 +114,39 @@ app.post('/api/chat', async (req, res) => {
           .map(a => a.from)
           .join(', ');
         return res.json({
-          answer: `❌ Sorry, those dates look unavailable.${alts ? ` Closest alternatives: ${alts}.` : ''}`
+          answer: `❌ Not available. Alternatives: ${alts || 'none found'}.`
         });
       }
     }
   } catch (e) {
-    // E.g., OpenAI 401/429/etc. Continue with RAG.
-    console.warn('[chat] LLM extract failed/limited — falling back to RAG:', (e as any)?.message || e);
+    console.warn('[chat] LLM extract failed — fallback to RAG');
   }
 
-  // Step 2: RAG answer (internally resilient; will fall back to snippets if OpenAI not available)
   try {
     const ans = await answerWithContext(message);
     return res.json(ans);
   } catch (e) {
-    console.error('[chat] RAG failed:', e);
-    return res.json({
-      answer:
-        "I couldn’t reach the AI service just now. You can ask like ‘from YYYY-MM-DD for N nights with D dogs’, or try again shortly."
-    });
+    return res.json({ answer: 'I had trouble contacting the AI service. Please try again later.' });
   }
 });
 
-/* ---------- Admin: ICS refresh ---------- */
+/* ---------- Admin endpoints ---------- */
 app.post('/admin/ics/refresh', async (req, res) => {
   if (req.headers['x-admin-token'] !== process.env.ADMIN_TOKEN) {
     return res.status(401).json({ error: 'unauthorized' });
   }
-  try {
-    await refreshIcs(true);
-    res.json({ ok: true, ics: getIcsStats?.() });
-  } catch (e: any) {
-    res.status(500).json({ error: e?.message || 'ics-refresh-error' });
-  }
+  await refreshIcs(true);
+  res.json({ ok: true, ics: getIcsStats?.() });
 });
 
-/* ---------- Admin: reindex site content (optional no-op) ---------- */
 app.post('/admin/reindex', async (req, res) => {
   if (req.headers['x-admin-token'] !== process.env.ADMIN_TOKEN) {
     return res.status(401).json({ error: 'unauthorized' });
   }
-  try {
-    await refreshContentIndex(true);
-    res.json({ ok: true });
-  } catch (e: any) {
-    res.status(500).json({ error: e?.message || 'reindex-error' });
-  }
+  await refreshContentIndex(true);
+  res.json({ ok: true });
 });
 
-/* ---------- Admin: ingest a PDF by URL ---------- */
 app.post('/admin/ingest-pdf', async (req, res) => {
   if (req.headers['x-admin-token'] !== process.env.ADMIN_TOKEN) {
     return res.status(401).json({ error: 'unauthorized' });
@@ -190,6 +157,7 @@ app.post('/admin/ingest-pdf', async (req, res) => {
     if (!url || !/^https?:\/\//i.test(url)) {
       return res.status(400).json({ error: 'Provide a valid PDF ?url=' });
     }
+    console.log('[pdf ingest] url received:', url); // ✅ Debugging aid
     const text = await extractPdfTextFromUrl(url);
     const result = await addExternalDocumentToIndex(name, url, text);
     res.json({ ok: true, ...result });
@@ -198,6 +166,6 @@ app.post('/admin/ingest-pdf', async (req, res) => {
   }
 });
 
-/* ---------- Start server ---------- */
+/* ---------- Start ---------- */
 const PORT = Number(process.env.PORT) || 3000;
 app.listen(PORT, () => console.log(`Server listening on :${PORT}`));
