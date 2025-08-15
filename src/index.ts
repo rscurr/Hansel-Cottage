@@ -13,15 +13,22 @@ import {
 } from './rag.js';
 import { extractPdfTextFromUrl, extractPdfTextFromFile } from './pdf.js';
 import { interpretMessageWithLLM } from './nlp.js';
+import { crawlSite } from './crawl.js';
 
 const app = express();
 app.use(express.json({ limit: '1mb' }));
 
-/* ---------- CORS ---------- */
+/* ---------- CORS (comma-separated origins) ---------- */
 const allowed = (process.env.ALLOWED_ORIGIN || '').split(',').map(s => s.trim()).filter(Boolean);
-app.use(cors({ origin: allowed.length ? allowed : true }));
+app.use(cors({
+  origin(origin, cb) {
+    if (!origin) return cb(null, true); // allow curl/local tools
+    if (allowed.includes('*') || allowed.includes(origin)) return cb(null, true);
+    return cb(new Error('Not allowed by CORS'));
+  }
+}));
 
-/* ---------- Static (widget, PDFs, etc.) ---------- */
+/* ---------- Static (widget, PDFs) ---------- */
 const publicDir = path.resolve(process.cwd(), 'public');
 app.use(express.static(publicDir));
 
@@ -63,25 +70,20 @@ app.post('/api/quote', (req, res) => {
   res.json(quoteForStay(parsed.data));
 });
 
-/* ---------- Helper: decide if a message is about booking/availability ---------- */
+/* ---------- Booking intent gate ---------- */
 function isBookingLike(message: string): boolean {
   const txt = message.toLowerCase();
-
-  // Fast path: obvious booking words
   const bookingWords = [
-    'available', 'availability', 'book', 'booking', 'reserve', 'reservation',
-    'price', 'pricing', 'cost', 'quote', 'deposit',
-    'night', 'nights', 'week', 'weekend', 'dogs', 'dog',
-    'check-in', 'check in', 'checkout', 'check-out'
+    'available','availability','book','booking','reserve','reservation',
+    'price','pricing','cost','quote','deposit',
+    'night','nights','week','weekend','dogs','dog',
+    'check-in','check in','checkout','check-out'
   ];
   if (bookingWords.some(w => txt.includes(w))) return true;
-
-  // Dates/ranges present?
-  if (/\b\d{4}-\d{2}-\d{2}\b/.test(txt)) return true;            // ISO date
-  if (/\bfrom\b.*\b(to|until)\b/.test(txt)) return true;         // "from X to/until Y"
+  if (/\b\d{4}-\d{2}-\d{2}\b/.test(txt)) return true;
+  if (/\bfrom\b.*\b(to|until)\b/.test(txt)) return true;
   if (/\bnext\s+(mon|tue|wed|thu|fri|sat|sun|monday|tuesday|wednesday|thursday|friday|saturday|sunday)\b/.test(txt)) return true;
   if (/\bthis\s+(mon|tue|wed|thu|fri|sat|sun|monday|tuesday|wednesday|thursday|friday|saturday|sunday|weekend)\b/.test(txt)) return true;
-
   return false;
 }
 
@@ -93,7 +95,7 @@ app.post('/api/chat', async (req, res) => {
 
   const message = parsed.data.message;
 
-  // 💡 Only try date extraction + availability flow if the message looks booking-related.
+  // Only run the booking/availability flow if booking-like; else use RAG
   if (isBookingLike(message)) {
     try {
       const intent = await interpretMessageWithLLM(message);
@@ -107,43 +109,57 @@ app.post('/api/chat', async (req, res) => {
           });
         } else {
           const alts = suggestAlternatives(intent.from, intent.nights, 10).slice(0, 3).map(a => a.from).join(', ');
-          return res.json({
-            answer: `❌ Sorry, those dates look unavailable.${alts ? ` Closest alternatives: ${alts}.` : ''}`
-          });
+          return res.json({ answer: `❌ Sorry, those dates look unavailable.${alts ? ` Closest alternatives: ${alts}.` : ''}` });
         }
       }
-      // If intent.kind !== 'dates', we’ll fall through to RAG below.
     } catch (e) {
-      console.warn('[chat] LLM extract failed/limited — falling back to RAG:', (e as any)?.message || e);
+      console.warn('[chat] LLM extract failed — falling back to RAG:', (e as any)?.message || e);
     }
   }
 
-  // 🔎 General questions → RAG (PDF/site). If OPENAI_API_KEY is set, this also phrases nicely.
+  // General Qs → RAG (PDF + website)
   try {
     const ans = await answerWithContext(message);
     return res.json(ans);
   } catch {
-    return res.json({
-      answer:
-        "I couldn’t reach the AI service just now. You can ask like ‘from YYYY-MM-DD for N nights with D dogs’, or try again shortly."
-    });
+    return res.json({ answer: 'I had trouble contacting the AI service. Please try again.' });
   }
 });
 
-/* ---------- Admin ---------- */
+/* ---------- Admin: ICS refresh ---------- */
 app.post('/admin/ics/refresh', async (req, res) => {
   if (req.headers['x-admin-token'] !== process.env.ADMIN_TOKEN) return res.status(401).json({ error: 'unauthorized' });
   await refreshIcs(true);
   res.json({ ok: true, ics: getIcsStats?.() });
 });
 
-app.post('/admin/reindex', async (req, res) => {
+/* ---------- Admin: reindex site (crawler) ---------- */
+app.post('/admin/ingest-site', async (req, res) => {
   if (req.headers['x-admin-token'] !== process.env.ADMIN_TOKEN) return res.status(401).json({ error: 'unauthorized' });
-  await refreshContentIndex(true);
-  res.json({ ok: true });
+  try {
+    const baseUrl = String(req.body?.baseUrl || req.query.baseUrl || process.env.SITE_BASE_URL || '');
+    if (!/^https?:\/\//i.test(baseUrl)) return res.status(400).json({ error: 'Provide ?baseUrl=https://yoursite or set SITE_BASE_URL' });
+
+    const sitemapUrl = String(req.body?.sitemap || req.query.sitemap || process.env.SITEMAP_URL || '');
+    const includeRe = (process.env.CRAWL_INCLUDE || req.body?.include || req.query.include)
+      ? new RegExp(String(process.env.CRAWL_INCLUDE || req.body?.include || req.query.include)) : undefined;
+    const excludeRe = (process.env.CRAWL_EXCLUDE || req.body?.exclude || req.query.exclude)
+      ? new RegExp(String(process.env.CRAWL_EXCLUDE || req.body?.exclude || req.query.exclude)) : undefined;
+    const maxPages = Number(req.body?.max || req.query.max || process.env.CRAWL_MAX || 50);
+
+    const pages = await crawlSite({ baseUrl, sitemapUrl: sitemapUrl || undefined, include: includeRe, exclude: excludeRe, maxPages });
+    let added = 0;
+    for (const p of pages) {
+      const r = await addExternalDocumentToIndex('WEB', p.url, p.text);
+      added += r.added;
+    }
+    res.json({ ok: true, pages: pages.length, chunks: added });
+  } catch (e: any) {
+    res.status(500).json({ error: e?.message || 'site-ingest-failed' });
+  }
 });
 
-// Normalize entries like "public/HouseInformation.pdf" → "HouseInformation.pdf"
+/* ---------- Admin: ingest a PDF ---------- */
 function normalizePublicEntry(entry: string): string {
   let e = entry.trim();
   if (e.startsWith('/')) e = e.slice(1);
@@ -175,16 +191,18 @@ app.post('/admin/ingest-pdf', async (req, res) => {
   }
 });
 
-/* ---------- Start & deferred boot tasks ---------- */
+/* ---------- Start & auto-ingest on boot ---------- */
 const PORT = Number(process.env.PORT) || 3000;
 app.listen(PORT, async () => {
   console.log(`Server listening on :${PORT}`);
 
+  // Initialize (non-blocking)
   refreshContentIndex().catch(e => console.error('[rag] init error', e));
   refreshIcs().catch(e => console.error('[ics] init error', e));
 
-  const raw = (process.env.PDF_URLS || '').split(',').map(s => s.trim()).filter(Boolean);
-  for (let entry of raw) {
+  // Auto-ingest PDFs on boot (comma-separated; support local /public or full URLs)
+  const pdfEntries = (process.env.PDF_URLS || '').split(',').map(s => s.trim()).filter(Boolean);
+  for (let entry of pdfEntries) {
     try {
       let text: string;
       if (/^https?:\/\//i.test(entry)) {
@@ -200,6 +218,24 @@ app.listen(PORT, async () => {
       console.log('[pdf boot] indexed:', entry);
     } catch (e) {
       console.error('[pdf] boot ingest failed:', entry, e);
+    }
+  }
+
+  // Auto-crawl website on boot if SITE_BASE_URL is set
+  const BASE = process.env.SITE_BASE_URL || '';
+  if (BASE) {
+    try {
+      const pages = await crawlSite({
+        baseUrl: BASE,
+        sitemapUrl: process.env.SITEMAP_URL || undefined,
+        include: process.env.CRAWL_INCLUDE ? new RegExp(process.env.CRAWL_INCLUDE) : undefined,
+        exclude: process.env.CRAWL_EXCLUDE ? new RegExp(process.env.CRAWL_EXCLUDE) : undefined,
+        maxPages: Number(process.env.CRAWL_MAX || 50)
+      });
+      for (const p of pages) await addExternalDocumentToIndex('WEB', p.url, p.text);
+      console.log('[crawl] indexed pages:', pages.length);
+    } catch (e) {
+      console.error('[crawl] boot crawl failed:', e);
     }
   }
 });
