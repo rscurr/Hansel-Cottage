@@ -70,9 +70,27 @@ app.post('/api/quote', (req, res) => {
   res.json(quoteForStay(parsed.data));
 });
 
+/* ---------- Small talk / chit-chat ---------- */
+function isChitChat(message: string): boolean {
+  const t = message.trim().toLowerCase();
+  return (
+    /^(hi|hey|hello|howdy)\b/.test(t) ||
+    /^(thanks|thank you|cheers|ta)$/.test(t) ||
+    /^(ok|okay|great|perfect|awesome|brilliant|sounds good|cool|nice)$/.test(t) ||
+    /^(bye|goodbye|see ya|see you|later)$/.test(t)
+  );
+}
+
+function replyChitChat(message: string): string {
+  const t = message.trim().toLowerCase();
+  if (/^(thanks|thank you|cheers|ta)$/.test(t)) return "You’re very welcome! Anything else I can help with?";
+  if (/^(hi|hey|hello|howdy)\b/.test(t)) return "Hi! 👋 How can I help—availability, pricing, or questions about the cottage?";
+  if (/^(ok|okay|great|perfect|awesome|brilliant|sounds good|cool|nice)$/.test(t)) return "👍 Got it. If you’d like, I can check dates or answer questions from the house info.";
+  if (/^(bye|goodbye|see ya|see you|later)$/.test(t)) return "Bye for now! If you need anything else, just pop back in.";
+  return "Happy to help! Would you like me to check dates or answer something about the cottage?";
+}
+
 /* ---------- Booking intent helpers ---------- */
-// Stricter heuristic: requires a booking verb or explicit date/range.
-// Pet/fence/garden words alone should NOT trigger booking flow.
 function hasDateHints(t: string): boolean {
   return (
     /\b\d{4}-\d{2}-\d{2}\b/.test(t) ||                                   // ISO date
@@ -89,7 +107,7 @@ function isBookingLikeHeuristic(message: string): boolean {
   const bookingVerbs =
     /\b(book|booking|reserve|reservation|availability|available|price|pricing|cost|quote|deposit|rate|rates)\b/;
 
-  // Clearly informational pet/garden queries should NOT trigger booking flow unless they also have dates/booking verbs
+  // Pet/garden keywords should NOT trigger booking flow unless there are booking verbs or dates
   const petGarden =
     /\b(dog|dogs|pet|pets|fence|fenced|garden|yard|gate|secure|safety|enclosure|lawn|grass)\b/;
 
@@ -97,14 +115,13 @@ function isBookingLikeHeuristic(message: string): boolean {
     return false;
   }
 
-  // Booking if explicit verb or any date/range hint
   if (bookingVerbs.test(t)) return true;
   if (hasDateHints(t)) return true;
 
   return false;
 }
 
-// Optional: small LLM intent classifier. Falls back to heuristic if API not available.
+// Optional tiny LLM classifier. Falls back to heuristic if no API key / failure.
 async function classifyIntentLLM(message: string): Promise<'booking' | 'info' | 'unknown'> {
   if (!process.env.OPENAI_API_KEY) return 'unknown';
   try {
@@ -146,7 +163,12 @@ app.post('/api/chat', async (req, res) => {
 
   const message = parsed.data.message;
 
-  // Decide booking intent: try LLM (if available), otherwise heuristic
+  // 1) Chit-chat: reply warmly and stop
+  if (isChitChat(message)) {
+    return res.json({ answer: replyChitChat(message) });
+  }
+
+  // 2) Decide booking intent: try LLM (if available), otherwise heuristic
   let bookingIntent = false;
   try {
     const label = await classifyIntentLLM(message);
@@ -157,7 +179,7 @@ app.post('/api/chat', async (req, res) => {
     bookingIntent = isBookingLikeHeuristic(message);
   }
 
-  // Booking/availability flow
+  // 3) Booking/availability flow
   if (bookingIntent) {
     try {
       const intent = await interpretMessageWithLLM(message);
@@ -180,7 +202,7 @@ app.post('/api/chat', async (req, res) => {
     }
   }
 
-  // General Qs → RAG (PDF + website)
+  // 4) General Qs → RAG (PDF + website)
   try {
     const ans = await answerWithContext(message);
     return res.json(ans);
