@@ -25,8 +25,7 @@ import {
   initSessionSweeper,
   getSession,
   pushMessage,
-  getRecentMessages,
-  type SessionMem
+  getRecentMessages
 } from './session.js';
 
 const app = express();
@@ -121,7 +120,10 @@ function isBookingLikeHeuristic(message: string): boolean {
   if (hasDateHints(t)) return true;
   return false;
 }
-async function classifyIntentLLM(message: string, history: Array<{role:'user'|'assistant',content:string}>): Promise<'booking'|'info'|'unknown'> {
+async function classifyIntentLLM(
+  message: string,
+  history: Array<{role:'user'|'assistant',content:string}>
+): Promise<'booking'|'info'|'unknown'> {
   if (!process.env.OPENAI_API_KEY) return 'unknown';
   try {
     const messages = [
@@ -145,31 +147,74 @@ async function classifyIntentLLM(message: string, history: Array<{role:'user'|'a
 
 /* ---------- Flexible month availability ---------- */
 const MONTHS = ['january','february','march','april','may','june','july','august','september','october','november','december'];
-function parseMonthAvailabilityRequest(message: string): { year: number; month: number; nights: number } | null {
+
+function extractMonthYearFromText(message: string): { year?: number; month?: number } {
   const t = message.toLowerCase();
   const m = t.match(/\b(january|february|march|april|may|june|july|august|september|october|november|december)\b(?:\s+(\d{4}))?/i);
-  if (!m) return null;
+  if (!m) return {};
   const monthName = m[1].toLowerCase();
+  let month = MONTHS.indexOf(monthName) + 1;
   let year = m[2] ? parseInt(m[2], 10) : undefined;
-  let nights = 0;
-  const week = /\b(a\s+week|one\s+week|1\s+week|for\s+a\s+week|for\s+1\s+week)\b/i.test(t);
-  if (week) nights = 7;
-  const nn = t.match(/\bfor\s+(\d+)\s+nights?\b/i) || t.match(/\b(\d+)\s+nights?\b/i);
-  if (!nights && nn) nights = Math.max(1, Math.min(30, parseInt(nn[1], 10)));
-  if (!nights) nights = 7;
-  const month = MONTHS.indexOf(monthName) + 1;
   if (!year) {
     const now = new Date();
     const nowMonth = now.getUTCMonth() + 1;
     const nowYear = now.getUTCFullYear();
     year = month >= nowMonth ? nowYear : nowYear + 1;
   }
-  return { year, month, nights };
+  return { year, month };
 }
-function isAffirmative(t: string) { t = t.trim().toLowerCase(); return /^(y|yes|yeah|yep|please|sure|go ahead|ok|okay|do it|sounds good)$/.test(t); }
-function isNegative(t: string)   { t = t.trim().toLowerCase(); return /^(n|no|nope|nah|not now|cancel|stop)$/.test(t); }
-function wantsNext(t: string)    { t = t.trim().toLowerCase(); return /\bnext\b/.test(t); }
-function wantsPrevious(t: string){ t = t.trim().toLowerCase(); return /\bprev(ious)?\b/.test(t); }
+
+function extractNightsFromText(message: string): number | undefined {
+  const t = message.toLowerCase();
+  if (/\b(a\s+week|one\s+week|1\s+week)\b/.test(t)) return 7;
+  const nn = t.match(/\bfor\s+(\d+)\s+nights?\b/i) || t.match(/\b(\d+)\s+nights?\b/i);
+  if (nn) {
+    const n = parseInt(nn[1], 10);
+    if (Number.isFinite(n)) return Math.max(1, Math.min(30, n));
+  }
+  // little friendly phrases:
+  if (/\b(long\s+weekend)\b/.test(t)) return 3;
+  return undefined;
+}
+
+function parseMonthAvailabilityRequest(message: string): { year: number; month: number; nights: number } | null {
+  const t = message.toLowerCase();
+  const mm = extractMonthYearFromText(t);
+  if (!mm.month || !mm.year) return null;
+  let nights = extractNightsFromText(t);
+  if (!nights) nights = 7; // sensible default
+  return { year: mm.year!, month: mm.month!, nights };
+}
+
+/* ---------- Robust follow-up helpers ---------- */
+function isNegative(raw: string) {
+  let t = raw.trim().toLowerCase().replace(/[!.\s]+$/g, '');
+  return (
+    /^n$/.test(t) ||
+    /\b(no|nope|nah|not now|cancel|stop|don’t|do not|rather not|no thanks|no thank you)\b/.test(t)
+  );
+}
+function isAffirmative(raw: string) {
+  let t = raw.trim().toLowerCase().replace(/[!.\s]+$/g, '');
+  // If explicit negatives are present, treat as negative first
+  if (isNegative(t)) return false;
+  // Strong yes words
+  if (
+    /\b(yes|yeah|yep|yup|sure|certainly|absolutely|of course|please do|go ahead|do it|ok|okay|alright|all right|sounds good|that works|that would be great|yes please|yes please do|yes go ahead|yes do)\b/.test(
+      t
+    )
+  ) return true;
+  // Single-word "please" shouldn't count as yes; ignore.
+  return /^y$/.test(t);
+}
+function wantsNext(t: string) {
+  t = t.trim().toLowerCase();
+  return /\bnext\b/.test(t);
+}
+function wantsPrevious(t: string) {
+  t = t.trim().toLowerCase();
+  return /\bprev(ious)?\b/.test(t);
+}
 
 /* ---------- Chat ---------- */
 const ChatReq = z.object({ message: z.string().min(1).max(2000) });
@@ -190,24 +235,34 @@ app.post('/api/chat', async (req, res) => {
     return res.json({ answer });
   }
 
-  // 2) Handle pending follow-ups first
+  // 2) Handle pending follow-ups FIRST (nearby months)
   if (session.pending?.kind === 'ask-nearby-months') {
-    const t = message.trim().toLowerCase();
+    // allow users to BOTH confirm and specify a new month/nights in one message
+    let { year, month, nights } = session.pending;
 
-    if (isNegative(t)) {
+    // parse any new month/year and/or nights from this reply
+    const mm = extractMonthYearFromText(message);
+    if (mm.month) month = mm.month!;
+    if (mm.year) year = mm.year!;
+    const n2 = extractNightsFromText(message);
+    if (typeof n2 === 'number') nights = n2;
+
+    // quick navigations
+    if (wantsNext(message)) { month += 1; if (month > 12) { month = 1; year += 1; } }
+    if (wantsPrevious(message)) { month -= 1; if (month < 1) { month = 12; year -= 1; } }
+
+    if (isNegative(message)) {
       session.pending = undefined;
       const answer = "No problem. Would you like me to search a different month or a different length of stay?";
       pushMessage(session, 'assistant', answer);
       return res.json({ answer });
     }
 
-    let { year, month, nights } = session.pending;
-    if (wantsNext(t)) { month += 1; if (month > 12) { month = 1; year += 1; } }
-    else if (wantsPrevious(t)) { month -= 1; if (month < 1) { month = 12; year -= 1; } }
-
-    if (isAffirmative(t) || wantsNext(t) || wantsPrevious(t)) {
-      const monthsToScan = isAffirmative(t) ? [0, 1, 2] : [0];
+    if (isAffirmative(message) || wantsNext(message) || wantsPrevious(message) || mm.month || typeof n2 === 'number') {
+      // If the user just said "yes", scan the next few months as well
+      const monthsToScan = isAffirmative(message) && !mm.month && typeof n2 !== 'number' ? [0, 1, 2] : [0];
       const results: Array<{ year: number; month: number; nights: number; options: Array<{ from: string; nights: number }> }> = [];
+
       for (const delta of monthsToScan) {
         let y = year, m = month + delta;
         while (m > 12) { m -= 12; y += 1; }
@@ -234,10 +289,10 @@ app.post('/api/chat', async (req, res) => {
         return res.json({ answer });
       }
     }
-    // else fall through for normal parsing (maybe they typed a new month/length)
+    // else fall through for normal parsing (maybe they typed a general question)
   }
 
-  // 3) Flexible month request
+  // 3) Flexible month request (first time)
   const flex = parseMonthAvailabilityRequest(message);
   if (flex) {
     const { year, month, nights } = flex;
@@ -270,7 +325,6 @@ app.post('/api/chat', async (req, res) => {
   // 5) Booking flow for specific dates
   if (bookingIntent) {
     try {
-      // If your interpretMessageWithLLM can accept history, wire it here; otherwise it still benefits from user message.
       const intent = await interpretMessageWithLLM(message);
       if (intent.kind === 'dates') {
         const available = isRangeAvailable(intent.from, intent.nights);
@@ -306,7 +360,7 @@ app.post('/api/chat', async (req, res) => {
   }
 });
 
-/* ---------- Admin & boot tasks (unchanged) ---------- */
+/* ---------- Admin & boot tasks ---------- */
 app.post('/admin/ics/refresh', async (req, res) => {
   if (req.headers['x-admin-token'] !== process.env.ADMIN_TOKEN) return res.status(401).json({ error: 'unauthorized' });
   await refreshIcs(true);
@@ -369,7 +423,6 @@ app.listen(PORT, async () => {
   refreshContentIndex().catch(e => console.error('[rag] init error', e));
   initSessionSweeper();
 
-  // You likely already call this
   refreshIcs().catch(e => console.error('[ics] init error', e));
 
   // PDFs
