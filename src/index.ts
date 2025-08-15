@@ -4,7 +4,7 @@ import cors from 'cors';
 import path from 'node:path';
 import { z } from 'zod';
 
-import { refreshIcs, isRangeAvailable, suggestAlternatives, getIcsStats } from './ics.js';
+import { refreshIcs, isRangeAvailable, suggestAlternatives, getIcsStats, findAvailabilityInMonth } from './ics.js';
 import { quoteForStay } from './pricing.js';
 import {
   answerWithContext,
@@ -80,7 +80,6 @@ function isChitChat(message: string): boolean {
     /^(bye|goodbye|see ya|see you|later)$/.test(t)
   );
 }
-
 function replyChitChat(message: string): string {
   const t = message.trim().toLowerCase();
   if (/^(thanks|thank you|cheers|ta)$/.test(t)) return "You’re very welcome! Anything else I can help with?";
@@ -93,53 +92,35 @@ function replyChitChat(message: string): string {
 /* ---------- Booking intent helpers ---------- */
 function hasDateHints(t: string): boolean {
   return (
-    /\b\d{4}-\d{2}-\d{2}\b/.test(t) ||                                   // ISO date
-    /\bfrom\b.*\b(to|until)\b/.test(t) ||                                 // from X to Y
-    /\bfor\s+\d+\s+nights?\b/.test(t) ||                                  // for 3 nights
-    /\b\d+\s+nights?\b/.test(t) ||                                        // 3 nights
+    /\b\d{4}-\d{2}-\d{2}\b/.test(t) ||
+    /\bfrom\b.*\b(to|until)\b/.test(t) ||
+    /\bfor\s+\d+\s+nights?\b/.test(t) ||
+    /\b\d+\s+nights?\b/.test(t) ||
     /\b(next|this)\s+(mon|tue|wed|thu|fri|sat|sun|monday|tuesday|wednesday|thursday|friday|saturday|sunday|weekend)\b/.test(t)
   );
 }
-
 function isBookingLikeHeuristic(message: string): boolean {
   const t = message.toLowerCase();
-
   const bookingVerbs =
     /\b(book|booking|reserve|reservation|availability|available|price|pricing|cost|quote|deposit|rate|rates)\b/;
-
-  // Pet/garden keywords should NOT trigger booking flow unless there are booking verbs or dates
   const petGarden =
     /\b(dog|dogs|pet|pets|fence|fenced|garden|yard|gate|secure|safety|enclosure|lawn|grass)\b/;
-
-  if (petGarden.test(t) && !bookingVerbs.test(t) && !hasDateHints(t)) {
-    return false;
-  }
-
+  if (petGarden.test(t) && !bookingVerbs.test(t) && !hasDateHints(t)) return false;
   if (bookingVerbs.test(t)) return true;
   if (hasDateHints(t)) return true;
-
   return false;
 }
-
-// Optional tiny LLM classifier. Falls back to heuristic if no API key / failure.
 async function classifyIntentLLM(message: string): Promise<'booking' | 'info' | 'unknown'> {
   if (!process.env.OPENAI_API_KEY) return 'unknown';
   try {
     const res = await fetch('https://api.openai.com/v1/chat/completions', {
       method: 'POST',
-      headers: {
-        'Content-Type': 'application/json',
-        Authorization: `Bearer ${process.env.OPENAI_API_KEY}`
-      },
+      headers: { 'Content-Type': 'application/json', Authorization: `Bearer ${process.env.OPENAI_API_KEY}` },
       body: JSON.stringify({
         model: 'gpt-4o-mini',
         temperature: 0,
         messages: [
-          {
-            role: 'system',
-            content:
-              'Classify the user message as "booking" (asks about dates, prices, availability, or making a reservation) or "info" (general questions about the property, pets, garden, rules, amenities, area). Reply with ONLY "booking" or "info".'
-          },
+          { role: 'system', content: 'Classify as "booking" (dates/prices/reservation) or "info" (general property questions). Respond ONLY with "booking" or "info".' },
           { role: 'user', content: message }
         ]
       })
@@ -150,9 +131,41 @@ async function classifyIntentLLM(message: string): Promise<'booking' | 'info' | 
     if (label.includes('booking')) return 'booking';
     if (label.includes('info')) return 'info';
     return 'unknown';
-  } catch {
-    return 'unknown';
+  } catch { return 'unknown'; }
+}
+
+/* ---------- Flexible month availability parsing ---------- */
+const MONTHS = [
+  'january','february','march','april','may','june',
+  'july','august','september','october','november','december'
+];
+function parseMonthAvailabilityRequest(message: string): { year: number; month: number; nights: number } | null {
+  const t = message.toLowerCase();
+
+  // Find month + optional year
+  const m = t.match(/\b(january|february|march|april|may|june|july|august|september|october|november|december)\b(?:\s+(\d{4}))?/i);
+  if (!m) return null;
+  const monthName = m[1].toLowerCase();
+  let year = m[2] ? parseInt(m[2], 10) : undefined;
+
+  // Nights: "for a week" or "for 7 nights" or "a week"
+  let nights = 0;
+  const week = /\b(a\s+week|one\s+week|1\s+week|for\s+a\s+week|for\s+1\s+week)\b/i.test(t);
+  if (week) nights = 7;
+  const nn = t.match(/\bfor\s+(\d+)\s+nights?\b/i) || t.match(/\b(\d+)\s+nights?\b/i);
+  if (!nights && nn) nights = Math.max(1, Math.min(30, parseInt(nn[1], 10)));
+  if (!nights) nights = 7; // sensible default
+
+  const month = MONTHS.indexOf(monthName) + 1;
+  if (!year) {
+    // If year not specified, choose the next occurrence of that month (Europe/London)
+    const now = new Date();
+    const nowMonth = now.getUTCMonth() + 1;
+    const nowYear = now.getUTCFullYear();
+    year = month >= nowMonth ? nowYear : nowYear + 1;
   }
+
+  return { year, month, nights };
 }
 
 /* ---------- Chat ---------- */
@@ -163,12 +176,32 @@ app.post('/api/chat', async (req, res) => {
 
   const message = parsed.data.message;
 
-  // 1) Chit-chat: reply warmly and stop
+  // 1) Chit-chat
   if (isChitChat(message)) {
     return res.json({ answer: replyChitChat(message) });
   }
 
-  // 2) Decide booking intent: try LLM (if available), otherwise heuristic
+  // 2) Special case: "availability in <month> <year> for <n nights>"
+  const flex = parseMonthAvailabilityRequest(message);
+  if (flex) {
+    const { year, month, nights } = flex;
+    const options = findAvailabilityInMonth(year, month, nights, 20);
+    if (options.length) {
+      const list = options.map(o => `• ${o.from} (${nights} nights)`).join('\n');
+      return res.json({
+        answer:
+          `Here are the available start dates in ${MONTHS[month-1][0].toUpperCase()+MONTHS[month-1].slice(1)} ${year} for ${nights} night(s):\n` +
+          list + `\n\nTell me which one you’d like and I can price it.`
+      });
+    } else {
+      return res.json({
+        answer: `I couldn’t find a ${nights}-night opening in ${MONTHS[month-1][0].toUpperCase()+MONTHS[month-1].slice(1)} ${year}. ` +
+                `Would you like me to look at nearby months or try a different length of stay?`
+      });
+    }
+  }
+
+  // 3) Decide booking intent (LLM if available → else heuristic)
   let bookingIntent = false;
   try {
     const label = await classifyIntentLLM(message);
@@ -179,7 +212,7 @@ app.post('/api/chat', async (req, res) => {
     bookingIntent = isBookingLikeHeuristic(message);
   }
 
-  // 3) Booking/availability flow
+  // 4) Booking/availability flow (specific dates)
   if (bookingIntent) {
     try {
       const intent = await interpretMessageWithLLM(message);
@@ -196,13 +229,13 @@ app.post('/api/chat', async (req, res) => {
           return res.json({ answer: `❌ Sorry, those dates look unavailable.${alts ? ` Closest alternatives: ${alts}.` : ''}` });
         }
       }
-      // If LLM didn't produce dates, drop to RAG
+      // If LLM didn't produce dates, continue to RAG
     } catch (e) {
       console.warn('[chat] LLM extract failed — falling back to RAG:', (e as any)?.message || e);
     }
   }
 
-  // 4) General Qs → RAG (PDF + website)
+  // 5) General questions → RAG
   try {
     const ans = await answerWithContext(message);
     return res.json(ans);
@@ -251,7 +284,6 @@ function normalizePublicEntry(entry: string): string {
   if (e.toLowerCase().startsWith('public/')) e = e.slice('public/'.length);
   return e;
 }
-
 app.post('/admin/ingest-pdf', async (req, res) => {
   if (req.headers['x-admin-token'] !== process.env.ADMIN_TOKEN) return res.status(401).json({ error: 'unauthorized' });
   try {
@@ -285,7 +317,7 @@ app.listen(PORT, async () => {
   refreshContentIndex().catch(e => console.error('[rag] init error', e));
   refreshIcs().catch(e => console.error('[ics] init error', e));
 
-  // Auto-ingest PDFs on boot (comma-separated; support local /public or full URLs)
+  // Auto-ingest PDFs on boot
   const pdfEntries = (process.env.PDF_URLS || '').split(',').map(s => s.trim()).filter(Boolean);
   for (let entry of pdfEntries) {
     try {
