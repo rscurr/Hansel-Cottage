@@ -1,7 +1,7 @@
 // src/crawl.ts
 import * as zlib from 'node:zlib';
 import { parseStringPromise } from 'xml2js';
-import cheerio from 'cheerio';
+import { load } from 'cheerio';
 
 function sameOrigin(a: string, b: string) {
   try { return new URL(a).origin === new URL(b).origin; } catch { return false; }
@@ -40,7 +40,7 @@ export async function fromSitemap(sitemapUrl: string): Promise<string[]> {
 }
 
 export async function extractReadableText(html: string, baseUrl: string): Promise<{ text: string, links: string[] }> {
-  const $ = cheerio.load(html);
+  const $ = load(html);
 
   // Remove boilerplate
   $('script,noscript,style,svg,nav,footer,header,form,iframe').remove();
