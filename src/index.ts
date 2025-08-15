@@ -4,7 +4,13 @@ import cors from 'cors';
 import path from 'node:path';
 import { z } from 'zod';
 
-import { refreshIcs, isRangeAvailable, suggestAlternatives, getIcsStats, findAvailabilityInMonth } from './ics.js';
+import {
+  refreshIcs,
+  isRangeAvailable,
+  suggestAlternatives,
+  getIcsStats,
+  findAvailabilityInMonth
+} from './ics.js';
 import { quoteForStay } from './pricing.js';
 import {
   answerWithContext,
@@ -15,14 +21,23 @@ import { extractPdfTextFromUrl, extractPdfTextFromFile } from './pdf.js';
 import { interpretMessageWithLLM } from './nlp.js';
 import { crawlSite } from './crawl.js';
 
+import {
+  initSessionSweeper,
+  getSession,
+  pushMessage,
+  getRecentMessages,
+  type SessionMem
+} from './session.js';
+
 const app = express();
 app.use(express.json({ limit: '1mb' }));
+app.set('trust proxy', 1); // so req.ip uses x-forwarded-for on Render
 
 /* ---------- CORS (comma-separated origins) ---------- */
 const allowed = (process.env.ALLOWED_ORIGIN || '').split(',').map(s => s.trim()).filter(Boolean);
 app.use(cors({
   origin(origin, cb) {
-    if (!origin) return cb(null, true); // allow curl/local tools and file://
+    if (!origin) return cb(null, true);
     if (allowed.includes('*') || allowed.includes(origin)) return cb(null, true);
     return cb(new Error('Not allowed by CORS'));
   }
@@ -42,7 +57,7 @@ app.get('/health', (_req, res) => {
   });
 });
 
-/* ---------- Availability ---------- */
+/* ---------- Availability endpoints ---------- */
 const AvailQuery = z.object({
   from: z.string().regex(/^\d{4}-\d{2}-\d{2}$/),
   nights: z.coerce.number().int().min(1).max(30)
@@ -50,7 +65,6 @@ const AvailQuery = z.object({
 app.get('/api/availability', (req, res) => {
   const parsed = AvailQuery.safeParse(req.query);
   if (!parsed.success) return res.status(400).json({ error: parsed.error.flatten() });
-
   const { from, nights } = parsed.data;
   const available = isRangeAvailable(from, nights);
   const reasons = available ? [] : ['Requested dates overlap an existing booking or violate rules'];
@@ -58,7 +72,6 @@ app.get('/api/availability', (req, res) => {
   res.json({ available, reasons, suggestions });
 });
 
-/* ---------- Quote ---------- */
 const QuoteReq = z.object({
   from: z.string().regex(/^\d{4}-\d{2}-\d{2}$/),
   nights: z.number().int().min(1).max(30),
@@ -70,7 +83,7 @@ app.post('/api/quote', (req, res) => {
   res.json(quoteForStay(parsed.data));
 });
 
-/* ---------- Small talk / chit-chat ---------- */
+/* ---------- Chit-chat ---------- */
 function isChitChat(message: string): boolean {
   const t = message.trim().toLowerCase();
   return (
@@ -89,7 +102,7 @@ function replyChitChat(message: string): string {
   return "Happy to help! Would you like me to check dates or answer something about the cottage?";
 }
 
-/* ---------- Booking intent helpers ---------- */
+/* ---------- Intent helpers ---------- */
 function hasDateHints(t: string): boolean {
   return (
     /\b\d{4}-\d{2}-\d{2}\b/.test(t) ||
@@ -101,29 +114,25 @@ function hasDateHints(t: string): boolean {
 }
 function isBookingLikeHeuristic(message: string): boolean {
   const t = message.toLowerCase();
-  const bookingVerbs =
-    /\b(book|booking|reserve|reservation|availability|available|price|pricing|cost|quote|deposit|rate|rates)\b/;
-  const petGarden =
-    /\b(dog|dogs|pet|pets|fence|fenced|garden|yard|gate|secure|safety|enclosure|lawn|grass)\b/;
+  const bookingVerbs = /\b(book|booking|reserve|reservation|availability|available|price|pricing|cost|quote|deposit|rate|rates)\b/;
+  const petGarden = /\b(dog|dogs|pet|pets|fence|fenced|garden|yard|gate|secure|safety|enclosure|lawn|grass)\b/;
   if (petGarden.test(t) && !bookingVerbs.test(t) && !hasDateHints(t)) return false;
   if (bookingVerbs.test(t)) return true;
   if (hasDateHints(t)) return true;
   return false;
 }
-async function classifyIntentLLM(message: string): Promise<'booking' | 'info' | 'unknown'> {
+async function classifyIntentLLM(message: string, history: Array<{role:'user'|'assistant',content:string}>): Promise<'booking'|'info'|'unknown'> {
   if (!process.env.OPENAI_API_KEY) return 'unknown';
   try {
+    const messages = [
+      { role: 'system', content: 'Classify as "booking" (dates/prices/reservation) or "info" (general property questions). Reply ONLY "booking" or "info". Consider the recent conversation.' },
+      ...history.slice(-6),
+      { role: 'user', content: message }
+    ];
     const res = await fetch('https://api.openai.com/v1/chat/completions', {
       method: 'POST',
       headers: { 'Content-Type': 'application/json', Authorization: `Bearer ${process.env.OPENAI_API_KEY}` },
-      body: JSON.stringify({
-        model: 'gpt-4o-mini',
-        temperature: 0,
-        messages: [
-          { role: 'system', content: 'Classify as "booking" (dates/prices/reservation) or "info" (general property questions). Respond ONLY with "booking" or "info".' },
-          { role: 'user', content: message }
-        ]
-      })
+      body: JSON.stringify({ model: 'gpt-4o-mini', temperature: 0, messages })
     });
     if (!res.ok) return 'unknown';
     const j: any = await res.json();
@@ -134,39 +143,33 @@ async function classifyIntentLLM(message: string): Promise<'booking' | 'info' | 
   } catch { return 'unknown'; }
 }
 
-/* ---------- Flexible month availability parsing ---------- */
-const MONTHS = [
-  'january','february','march','april','may','june',
-  'july','august','september','october','november','december'
-];
+/* ---------- Flexible month availability ---------- */
+const MONTHS = ['january','february','march','april','may','june','july','august','september','october','november','december'];
 function parseMonthAvailabilityRequest(message: string): { year: number; month: number; nights: number } | null {
   const t = message.toLowerCase();
-
-  // Find month + optional year
   const m = t.match(/\b(january|february|march|april|may|june|july|august|september|october|november|december)\b(?:\s+(\d{4}))?/i);
   if (!m) return null;
   const monthName = m[1].toLowerCase();
   let year = m[2] ? parseInt(m[2], 10) : undefined;
-
-  // Nights: "for a week" or "for 7 nights" or "a week"
   let nights = 0;
   const week = /\b(a\s+week|one\s+week|1\s+week|for\s+a\s+week|for\s+1\s+week)\b/i.test(t);
   if (week) nights = 7;
   const nn = t.match(/\bfor\s+(\d+)\s+nights?\b/i) || t.match(/\b(\d+)\s+nights?\b/i);
   if (!nights && nn) nights = Math.max(1, Math.min(30, parseInt(nn[1], 10)));
-  if (!nights) nights = 7; // sensible default
-
+  if (!nights) nights = 7;
   const month = MONTHS.indexOf(monthName) + 1;
   if (!year) {
-    // If year not specified, choose the next occurrence of that month (Europe/London)
     const now = new Date();
     const nowMonth = now.getUTCMonth() + 1;
     const nowYear = now.getUTCFullYear();
     year = month >= nowMonth ? nowYear : nowYear + 1;
   }
-
   return { year, month, nights };
 }
+function isAffirmative(t: string) { t = t.trim().toLowerCase(); return /^(y|yes|yeah|yep|please|sure|go ahead|ok|okay|do it|sounds good)$/.test(t); }
+function isNegative(t: string)   { t = t.trim().toLowerCase(); return /^(n|no|nope|nah|not now|cancel|stop)$/.test(t); }
+function wantsNext(t: string)    { t = t.trim().toLowerCase(); return /\bnext\b/.test(t); }
+function wantsPrevious(t: string){ t = t.trim().toLowerCase(); return /\bprev(ious)?\b/.test(t); }
 
 /* ---------- Chat ---------- */
 const ChatReq = z.object({ message: z.string().min(1).max(2000) });
@@ -175,96 +178,150 @@ app.post('/api/chat', async (req, res) => {
   if (!parsed.success) return res.status(400).json({ error: parsed.error.flatten() });
 
   const message = parsed.data.message;
+  const session = getSession(req);
+
+  // record user message
+  pushMessage(session, 'user', message);
 
   // 1) Chit-chat
   if (isChitChat(message)) {
-    return res.json({ answer: replyChitChat(message) });
+    const answer = replyChitChat(message);
+    pushMessage(session, 'assistant', answer);
+    return res.json({ answer });
   }
 
-  // 2) Special case: "availability in <month> <year> for <n nights>"
+  // 2) Handle pending follow-ups first
+  if (session.pending?.kind === 'ask-nearby-months') {
+    const t = message.trim().toLowerCase();
+
+    if (isNegative(t)) {
+      session.pending = undefined;
+      const answer = "No problem. Would you like me to search a different month or a different length of stay?";
+      pushMessage(session, 'assistant', answer);
+      return res.json({ answer });
+    }
+
+    let { year, month, nights } = session.pending;
+    if (wantsNext(t)) { month += 1; if (month > 12) { month = 1; year += 1; } }
+    else if (wantsPrevious(t)) { month -= 1; if (month < 1) { month = 12; year -= 1; } }
+
+    if (isAffirmative(t) || wantsNext(t) || wantsPrevious(t)) {
+      const monthsToScan = isAffirmative(t) ? [0, 1, 2] : [0];
+      const results: Array<{ year: number; month: number; nights: number; options: Array<{ from: string; nights: number }> }> = [];
+      for (const delta of monthsToScan) {
+        let y = year, m = month + delta;
+        while (m > 12) { m -= 12; y += 1; }
+        const opts = findAvailabilityInMonth(y, m, nights, 20);
+        if (opts.length) results.push({ year: y, month: m, nights, options: opts });
+      }
+
+      if (results.length) {
+        session.pending = undefined;
+        const bullets = results.map(r => {
+          const niceMonth = MONTHS[r.month - 1][0].toUpperCase() + MONTHS[r.month - 1].slice(1);
+          const lines = r.options.map(o => `• ${o.from} (${r.nights} nights)`).join('\n');
+          return `**${niceMonth} ${r.year}**\n${lines}`;
+        }).join('\n\n');
+
+        const answer = `Here are options I found:\n\n${bullets}\n\nTell me which date you prefer, or say "next" to see the following month.`;
+        pushMessage(session, 'assistant', answer);
+        return res.json({ answer });
+      } else {
+        session.pending = { kind: 'ask-nearby-months', year, month, nights };
+        const niceMonth = MONTHS[month - 1][0].toUpperCase() + MONTHS[month - 1].slice(1);
+        const answer = `I still can’t find a ${nights}-night opening in ${niceMonth} ${year}. Say "next" to check the following month, or tell me a different month or length of stay.`;
+        pushMessage(session, 'assistant', answer);
+        return res.json({ answer });
+      }
+    }
+    // else fall through for normal parsing (maybe they typed a new month/length)
+  }
+
+  // 3) Flexible month request
   const flex = parseMonthAvailabilityRequest(message);
   if (flex) {
     const { year, month, nights } = flex;
     const options = findAvailabilityInMonth(year, month, nights, 20);
     if (options.length) {
       const list = options.map(o => `• ${o.from} (${nights} nights)`).join('\n');
-      return res.json({
-        answer:
-          `Here are the available start dates in ${MONTHS[month-1][0].toUpperCase()+MONTHS[month-1].slice(1)} ${year} for ${nights} night(s):\n` +
-          list + `\n\nTell me which one you’d like and I can price it.`
-      });
+      const answer =
+        `Here are the available start dates in ${MONTHS[month-1][0].toUpperCase()+MONTHS[month-1].slice(1)} ${year} for ${nights} night(s):\n` +
+        list + `\n\nTell me which one you’d like and I can price it.`;
+      pushMessage(session, 'assistant', answer);
+      return res.json({ answer });
     } else {
-      return res.json({
-        answer: `I couldn’t find a ${nights}-night opening in ${MONTHS[month-1][0].toUpperCase()+MONTHS[month-1].slice(1)} ${year}. ` +
-                `Would you like me to look at nearby months or try a different length of stay?`
-      });
+      const niceMonth = MONTHS[month - 1][0].toUpperCase() + MONTHS[month - 1].slice(1);
+      session.pending = { kind: 'ask-nearby-months', year, month, nights };
+      const answer = `I couldn’t find a ${nights}-night opening in ${niceMonth} ${year}. Would you like me to look at nearby months or try a different length of stay?`;
+      pushMessage(session, 'assistant', answer);
+      return res.json({ answer });
     }
   }
 
-  // 3) Decide booking intent (LLM if available → else heuristic)
+  // 4) Booking intent decision (consider history)
   let bookingIntent = false;
   try {
-    const label = await classifyIntentLLM(message);
-    if (label === 'booking') bookingIntent = true;
-    else if (label === 'info') bookingIntent = false;
-    else bookingIntent = isBookingLikeHeuristic(message);
+    const label = await classifyIntentLLM(message, getRecentMessages(session, 6));
+    bookingIntent = (label === 'booking') ? true : (label === 'info') ? false : isBookingLikeHeuristic(message);
   } catch {
     bookingIntent = isBookingLikeHeuristic(message);
   }
 
-  // 4) Booking/availability flow (specific dates)
+  // 5) Booking flow for specific dates
   if (bookingIntent) {
     try {
+      // If your interpretMessageWithLLM can accept history, wire it here; otherwise it still benefits from user message.
       const intent = await interpretMessageWithLLM(message);
       if (intent.kind === 'dates') {
         const available = isRangeAvailable(intent.from, intent.nights);
         if (available) {
           const quote = quoteForStay({ from: intent.from, nights: intent.nights, dogs: intent.dogs });
           const dogsText = intent.dogs ? ` (incl. ${intent.dogs} dog${intent.dogs > 1 ? 's' : ''})` : '';
-          return res.json({
-            answer: `✅ Yes, it looks available from ${intent.from} for ${intent.nights} night(s). Estimated total: ${quote.currency} ${quote.total}${dogsText}.`
-          });
+          const answer = `✅ Yes, it looks available from ${intent.from} for ${intent.nights} night(s). Estimated total: ${quote.currency} ${quote.total}${dogsText}.`;
+          pushMessage(session, 'assistant', answer);
+          return res.json({ answer });
         } else {
           const alts = suggestAlternatives(intent.from, intent.nights, 10).slice(0, 3).map(a => a.from).join(', ');
-          return res.json({ answer: `❌ Sorry, those dates look unavailable.${alts ? ` Closest alternatives: ${alts}.` : ''}` });
+          const answer = `❌ Sorry, those dates look unavailable.${alts ? ` Closest alternatives: ${alts}.` : ''}`;
+          pushMessage(session, 'assistant', answer);
+          return res.json({ answer });
         }
       }
-      // If LLM didn't produce dates, continue to RAG
+      // If LLM didn't produce dates, fall through to RAG
     } catch (e) {
       console.warn('[chat] LLM extract failed — falling back to RAG:', (e as any)?.message || e);
     }
   }
 
-  // 5) General questions → RAG
+  // 6) General questions → RAG (pass history for better phrasing)
   try {
-    const ans = await answerWithContext(message);
+    const ans = await answerWithContext(message, getRecentMessages(session, 8));
+    const answer = ans.answer;
+    pushMessage(session, 'assistant', answer);
     return res.json(ans);
   } catch {
-    return res.json({ answer: 'I had trouble contacting the AI service. Please try again.' });
+    const answer = 'I had trouble contacting the AI service. Please try again.';
+    pushMessage(session, 'assistant', answer);
+    return res.json({ answer });
   }
 });
 
-/* ---------- Admin: ICS refresh ---------- */
+/* ---------- Admin & boot tasks (unchanged) ---------- */
 app.post('/admin/ics/refresh', async (req, res) => {
   if (req.headers['x-admin-token'] !== process.env.ADMIN_TOKEN) return res.status(401).json({ error: 'unauthorized' });
   await refreshIcs(true);
   res.json({ ok: true, ics: getIcsStats?.() });
 });
 
-/* ---------- Admin: reindex site (crawler) ---------- */
 app.post('/admin/ingest-site', async (req, res) => {
   if (req.headers['x-admin-token'] !== process.env.ADMIN_TOKEN) return res.status(401).json({ error: 'unauthorized' });
   try {
     const baseUrl = String(req.body?.baseUrl || req.query.baseUrl || process.env.SITE_BASE_URL || '');
     if (!/^https?:\/\//i.test(baseUrl)) return res.status(400).json({ error: 'Provide ?baseUrl=https://yoursite or set SITE_BASE_URL' });
-
     const sitemapUrl = String(req.body?.sitemap || req.query.sitemap || process.env.SITEMAP_URL || '');
-    const includeRe = (process.env.CRAWL_INCLUDE || req.body?.include || req.query.include)
-      ? new RegExp(String(process.env.CRAWL_INCLUDE || req.body?.include || req.query.include)) : undefined;
-    const excludeRe = (process.env.CRAWL_EXCLUDE || req.body?.exclude || req.query.exclude)
-      ? new RegExp(String(process.env.CRAWL_EXCLUDE || req.body?.exclude || req.query.exclude)) : undefined;
+    const includeRe = (process.env.CRAWL_INCLUDE || req.body?.include || req.query.include) ? new RegExp(String(process.env.CRAWL_INCLUDE || req.body?.include || req.query.include)) : undefined;
+    const excludeRe = (process.env.CRAWL_EXCLUDE || req.body?.exclude || req.query.exclude) ? new RegExp(String(process.env.CRAWL_EXCLUDE || req.body?.exclude || req.query.exclude)) : undefined;
     const maxPages = Number(req.body?.max || req.query.max || process.env.CRAWL_MAX || 50);
-
     const pages = await crawlSite({ baseUrl, sitemapUrl: sitemapUrl || undefined, include: includeRe, exclude: excludeRe, maxPages });
     let added = 0;
     for (const p of pages) {
@@ -277,7 +334,6 @@ app.post('/admin/ingest-site', async (req, res) => {
   }
 });
 
-/* ---------- Admin: ingest a PDF ---------- */
 function normalizePublicEntry(entry: string): string {
   let e = entry.trim();
   if (e.startsWith('/')) e = e.slice(1);
@@ -290,7 +346,6 @@ app.post('/admin/ingest-pdf', async (req, res) => {
     let url = String((req.body && (req.body.url || req.query.url)) || '');
     const name = String((req.body && (req.body.name || req.query.name)) || 'PDF');
     if (!url) return res.status(400).json({ error: 'Provide a PDF url or relative filename in /public' });
-
     let text: string;
     if (/^https?:\/\//i.test(url)) {
       console.log('[pdf ingest] HTTP:', url);
@@ -308,16 +363,16 @@ app.post('/admin/ingest-pdf', async (req, res) => {
   }
 });
 
-/* ---------- Start & auto-ingest on boot ---------- */
 const PORT = Number(process.env.PORT) || 3000;
 app.listen(PORT, async () => {
   console.log(`Server listening on :${PORT}`);
-
-  // Initialize (non-blocking)
   refreshContentIndex().catch(e => console.error('[rag] init error', e));
+  initSessionSweeper();
+
+  // You likely already call this
   refreshIcs().catch(e => console.error('[ics] init error', e));
 
-  // Auto-ingest PDFs on boot
+  // PDFs
   const pdfEntries = (process.env.PDF_URLS || '').split(',').map(s => s.trim()).filter(Boolean);
   for (let entry of pdfEntries) {
     try {
@@ -333,12 +388,10 @@ app.listen(PORT, async () => {
       }
       await addExternalDocumentToIndex('PDF', entry, text);
       console.log('[pdf boot] indexed:', entry);
-    } catch (e) {
-      console.error('[pdf] boot ingest failed:', entry, e);
-    }
+    } catch (e) { console.error('[pdf] boot ingest failed:', entry, e); }
   }
 
-  // Auto-crawl website on boot if SITE_BASE_URL is set
+  // Crawl website if configured
   const BASE = process.env.SITE_BASE_URL || '';
   if (BASE) {
     try {
@@ -351,8 +404,6 @@ app.listen(PORT, async () => {
       });
       for (const p of pages) await addExternalDocumentToIndex('WEB', p.url, p.text);
       console.log('[crawl] indexed pages:', pages.length);
-    } catch (e) {
-      console.error('[crawl] boot crawl failed:', e);
-    }
+    } catch (e) { console.error('[crawl] boot crawl failed:', e); }
   }
 });
