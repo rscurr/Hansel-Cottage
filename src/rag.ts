@@ -33,7 +33,7 @@ function splitIntoChunks(text: string, sourceUrl: string, maxLen = 1000): Chunk[
   const out: Chunk[] = [];
   let buf = '';
   for (const p of paras) {
-    if ((buf ? buf + '\n\n' : '') .length + p.length > maxLen && buf) {
+    if ((buf ? buf + '\n\n' : '').length + p.length > maxLen && buf) {
       out.push({ id: cryptoId(), url: sourceUrl, text: buf });
       buf = p;
     } else {
@@ -81,7 +81,6 @@ async function embedBatch(texts: string[]): Promise<number[][]> {
       body: JSON.stringify({ model: 'text-embedding-3-small', input: texts })
     });
     if (!res.ok) {
-      // Don’t throw — just fall back quietly
       return [];
     }
     const j: any = await res.json();
@@ -97,7 +96,7 @@ async function embedQuery(text: string): Promise<number[]> {
   return out[0] || [];
 }
 
-/** Optional LLM phrasing over retrieved context */
+/** Optional LLM phrasing over retrieved context (friendlier tone) */
 async function chatWithContext(prompt: string, context: string): Promise<string> {
   if (!OPENAI_API_KEY) return '';
   try {
@@ -106,12 +105,14 @@ async function chatWithContext(prompt: string, context: string): Promise<string>
       headers: { 'Content-Type': 'application/json', Authorization: `Bearer ${OPENAI_API_KEY}` },
       body: JSON.stringify({
         model: 'gpt-4o-mini',
-        temperature: 0.2,
+        temperature: 0.25,
         messages: [
           {
             role: 'system',
             content:
-              'You are a helpful holiday-cottage assistant. Answer using ONLY the provided context. If the answer is not in context, say you do not know.'
+              "You are a friendly, concise holiday-cottage assistant. Prefer using the provided context. " +
+              "If the info isn't in context, say so briefly and suggest how the guest can ask (e.g., provide dates, nights, dogs) " +
+              "or offer related info you do have. Keep replies short, clear, and helpful."
           },
           { role: 'user', content: `Context:\n${context}\n\nQuestion: ${prompt}` }
         ]
@@ -125,11 +126,10 @@ async function chatWithContext(prompt: string, context: string): Promise<string>
   }
 }
 
-/** Public: add external document (e.g., PDF) into the index (with optional embeddings) */
+/** Public: add external document (e.g., PDF/WEB) into the index (with optional embeddings) */
 export async function addExternalDocumentToIndex(title: string, sourceUrl: string, text: string): Promise<{ added: number; title: string; sourceUrl: string }> {
   const newChunks = splitIntoChunks(text, sourceUrl);
 
-  // Try to embed if key present; ignore failures
   if (OPENAI_API_KEY && newChunks.length) {
     const vecs = await embedBatch(newChunks.map((c) => c.text));
     if (vecs.length === newChunks.length) {
@@ -143,10 +143,7 @@ export async function addExternalDocumentToIndex(title: string, sourceUrl: strin
   return { added: newChunks.length, title, sourceUrl };
 }
 
-/** Answer a user query with RAG.
- * If OPENAI_API_KEY is present: tries LLM phrasing over top context.
- * Otherwise: returns helpful snippets (no external calls).
- */
+/** Answer a user query with RAG. */
 export async function answerWithContext(message: string): Promise<{ answer: string; sources?: string[]; context?: Array<{ url: string; snippet: string }> }> {
   if (chunks.length === 0) {
     console.log('[rag] no chunks loaded; returning snippets fallback');
@@ -188,8 +185,15 @@ export async function answerWithContext(message: string): Promise<{ answer: stri
   }
 
   // Snippet-only fallback (no LLM)
+  if (top.length === 0) {
+    return {
+      answer:
+        "I don’t have that in my notes yet. You can ask me about availability (with dates), prices, house info, or local area details."
+    };
+  }
+
   return {
-    answer: 'Here are the most relevant details I found on the site.',
+    answer: 'Here are the most relevant details I found:',
     context: top.map((t) => ({ url: t.url, snippet: t.text.slice(0, 500) }))
   };
 }
