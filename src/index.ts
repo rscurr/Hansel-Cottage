@@ -30,7 +30,7 @@ import {
 
 const app = express();
 app.use(express.json({ limit: '1mb' }));
-app.set('trust proxy', 1); // so req.ip uses x-forwarded-for on Render
+app.set('trust proxy', 1);
 
 /* ---------- CORS (comma-separated origins) ---------- */
 const allowed = (process.env.ALLOWED_ORIGIN || '').split(',').map(s => s.trim()).filter(Boolean);
@@ -39,7 +39,8 @@ app.use(cors({
     if (!origin) return cb(null, true);
     if (allowed.includes('*') || allowed.includes(origin)) return cb(null, true);
     return cb(new Error('Not allowed by CORS'));
-  }
+  },
+  allowedHeaders: ['Content-Type', 'X-Session-Id']
 }));
 
 /* ---------- Static (widget, PDFs) ---------- */
@@ -76,10 +77,11 @@ const QuoteReq = z.object({
   nights: z.number().int().min(1).max(30),
   dogs: z.number().int().min(0).max(4).default(0)
 });
-app.post('/api/quote', (req, res) => {
+app.post('/api/quote', async (req, res) => {
   const parsed = QuoteReq.safeParse(req.body);
   if (!parsed.success) return res.status(400).json({ error: parsed.error.flatten() });
-  res.json(quoteForStay(parsed.data));
+  const q = await quoteForStay(parsed.data);
+  res.json(q);
 });
 
 /* ---------- Chit-chat ---------- */
@@ -172,7 +174,6 @@ function extractNightsFromText(message: string): number | undefined {
     const n = parseInt(nn[1], 10);
     if (Number.isFinite(n)) return Math.max(1, Math.min(30, n));
   }
-  // little friendly phrases:
   if (/\b(long\s+weekend)\b/.test(t)) return 3;
   return undefined;
 }
@@ -182,7 +183,7 @@ function parseMonthAvailabilityRequest(message: string): { year: number; month: 
   const mm = extractMonthYearFromText(t);
   if (!mm.month || !mm.year) return null;
   let nights = extractNightsFromText(t);
-  if (!nights) nights = 7; // sensible default
+  if (!nights) nights = 7;
   return { year: mm.year!, month: mm.month!, nights };
 }
 
@@ -196,15 +197,8 @@ function isNegative(raw: string) {
 }
 function isAffirmative(raw: string) {
   let t = raw.trim().toLowerCase().replace(/[!.\s]+$/g, '');
-  // If explicit negatives are present, treat as negative first
   if (isNegative(t)) return false;
-  // Strong yes words
-  if (
-    /\b(yes|yeah|yep|yup|sure|certainly|absolutely|of course|please do|go ahead|do it|ok|okay|alright|all right|sounds good|that works|that would be great|yes please|yes please do|yes go ahead|yes do)\b/.test(
-      t
-    )
-  ) return true;
-  // Single-word "please" shouldn't count as yes; ignore.
+  if (/\b(yes|yeah|yep|yup|sure|certainly|absolutely|of course|please do|go ahead|do it|ok|okay|alright|all right|sounds good|that works|that would be great|yes please|yes please do|yes go ahead|yes do)\b/.test(t)) return true;
   return /^y$/.test(t);
 }
 function wantsNext(t: string) {
@@ -214,6 +208,19 @@ function wantsNext(t: string) {
 function wantsPrevious(t: string) {
   t = t.trim().toLowerCase();
   return /\bprev(ious)?\b/.test(t);
+}
+
+/* ---------- helpers: price peek with timeout ---------- */
+async function withTimeout<T>(p: Promise<T>, ms = 2000, onTimeout: () => T): Promise<T> {
+  let to: NodeJS.Timeout;
+  return await Promise.race([
+    p.finally(() => clearTimeout(to)),
+    new Promise<T>(resolve => { to = setTimeout(() => resolve(onTimeout()), ms); })
+  ]);
+}
+
+function fmtGBP(n: number): string {
+  return `£${(Math.round(n * 100) / 100).toFixed(2)}`;
 }
 
 /* ---------- Chat ---------- */
@@ -237,17 +244,15 @@ app.post('/api/chat', async (req, res) => {
 
   // 2) Handle pending follow-ups FIRST (nearby months)
   if (session.pending?.kind === 'ask-nearby-months') {
-    // allow users to BOTH confirm and specify a new month/nights in one message
     let { year, month, nights } = session.pending;
 
-    // parse any new month/year and/or nights from this reply
+    // parse tweaks in follow-up
     const mm = extractMonthYearFromText(message);
     if (mm.month) month = mm.month!;
     if (mm.year) year = mm.year!;
     const n2 = extractNightsFromText(message);
     if (typeof n2 === 'number') nights = n2;
 
-    // quick navigations
     if (wantsNext(message)) { month += 1; if (month > 12) { month = 1; year += 1; } }
     if (wantsPrevious(message)) { month -= 1; if (month < 1) { month = 12; year -= 1; } }
 
@@ -259,10 +264,8 @@ app.post('/api/chat', async (req, res) => {
     }
 
     if (isAffirmative(message) || wantsNext(message) || wantsPrevious(message) || mm.month || typeof n2 === 'number') {
-      // If the user just said "yes", scan the next few months as well
       const monthsToScan = isAffirmative(message) && !mm.month && typeof n2 !== 'number' ? [0, 1, 2] : [0];
       const results: Array<{ year: number; month: number; nights: number; options: Array<{ from: string; nights: number }> }> = [];
-
       for (const delta of monthsToScan) {
         let y = year, m = month + delta;
         while (m > 12) { m -= 12; y += 1; }
@@ -272,13 +275,25 @@ app.post('/api/chat', async (req, res) => {
 
       if (results.length) {
         session.pending = undefined;
-        const bullets = results.map(r => {
-          const niceMonth = MONTHS[r.month - 1][0].toUpperCase() + MONTHS[r.month - 1].slice(1);
-          const lines = r.options.map(o => `• ${o.from} (${r.nights} nights)`).join('\n');
-          return `**${niceMonth} ${r.year}**\n${lines}`;
-        }).join('\n\n');
 
-        const answer = `Here are options I found:\n\n${bullets}\n\nTell me which date you prefer, or say "next" to see the following month.`;
+        // Attach price peeks (first 5 per bucket to keep it snappy)
+        const bullets: string[] = [];
+        for (const r of results) {
+          const niceMonth = MONTHS[r.month - 1][0].toUpperCase() + MONTHS[r.month - 1].slice(1);
+          const subset = r.options.slice(0, 5);
+          const priced = await Promise.all(subset.map(async o => {
+            const q = await withTimeout(
+              quoteForStay({ from: o.from, nights: r.nights, dogs: 0 }),
+              2000,
+              () => ({ total: 0, currency: 'GBP', from: o.from, nights: r.nights, dogs: 0, lineItems: [], subtotal: 0, tax: 0, nightly: [] } as any)
+            );
+            const priceTxt = q && typeof (q as any).total === 'number' && (q as any).total > 0 ? ` — ${fmtGBP((q as any).total)}` : '';
+            return `• ${o.from} (${r.nights} nights)${priceTxt}`;
+          }));
+          bullets.push(`**${niceMonth} ${r.year}**\n` + priced.join('\n'));
+        }
+
+        const answer = `Here are options I found:\n\n${bullets.join('\n\n')}\n\nTell me which date you prefer, or say "next" to see the following month.`;
         pushMessage(session, 'assistant', answer);
         return res.json({ answer });
       } else {
@@ -289,7 +304,6 @@ app.post('/api/chat', async (req, res) => {
         return res.json({ answer });
       }
     }
-    // else fall through for normal parsing (maybe they typed a general question)
   }
 
   // 3) Flexible month request (first time)
@@ -298,10 +312,22 @@ app.post('/api/chat', async (req, res) => {
     const { year, month, nights } = flex;
     const options = findAvailabilityInMonth(year, month, nights, 20);
     if (options.length) {
-      const list = options.map(o => `• ${o.from} (${nights} nights)`).join('\n');
+      // Price the first 8 to keep latency reasonable
+      const first = options.slice(0, 8);
+      const priced = await Promise.all(first.map(async o => {
+        const q = await withTimeout(
+          quoteForStay({ from: o.from, nights, dogs: 0 }),
+          2000,
+          () => ({ total: 0 } as any)
+        );
+        const priceTxt = q && typeof (q as any).total === 'number' && (q as any).total > 0 ? ` — ${fmtGBP((q as any).total)}` : '';
+        return `• ${o.from} (${nights} nights)${priceTxt}`;
+      }));
+      const niceMonth = MONTHS[month-1][0].toUpperCase()+MONTHS[month-1].slice(1);
       const answer =
-        `Here are the available start dates in ${MONTHS[month-1][0].toUpperCase()+MONTHS[month-1].slice(1)} ${year} for ${nights} night(s):\n` +
-        list + `\n\nTell me which one you’d like and I can price it.`;
+        `Here are the available start dates in ${niceMonth} ${year} for ${nights} night(s):\n` +
+        priced.join('\n') +
+        `\n\nTell me which one you’d like and I can price it in full and give you booking steps.`;
       pushMessage(session, 'assistant', answer);
       return res.json({ answer });
     } else {
@@ -329,14 +355,23 @@ app.post('/api/chat', async (req, res) => {
       if (intent.kind === 'dates') {
         const available = isRangeAvailable(intent.from, intent.nights);
         if (available) {
-          const quote = quoteForStay({ from: intent.from, nights: intent.nights, dogs: intent.dogs });
-          const dogsText = intent.dogs ? ` (incl. ${intent.dogs} dog${intent.dogs > 1 ? 's' : ''})` : '';
-          const answer = `✅ Yes, it looks available from ${intent.from} for ${intent.nights} night(s). Estimated total: ${quote.currency} ${quote.total}${dogsText}.`;
+          const q = await quoteForStay({ from: intent.from, nights: intent.nights, dogs: 0 });
+          const answer = `✅ Available from ${intent.from} for ${intent.nights} night(s). Estimated total: ${q.currency} ${q.total}. Would you like the booking link?`;
           pushMessage(session, 'assistant', answer);
           return res.json({ answer });
         } else {
-          const alts = suggestAlternatives(intent.from, intent.nights, 10).slice(0, 3).map(a => a.from).join(', ');
-          const answer = `❌ Sorry, those dates look unavailable.${alts ? ` Closest alternatives: ${alts}.` : ''}`;
+          const alts = suggestAlternatives(intent.from, intent.nights, 6).slice(0, 5);
+          // Price peeks for alternatives
+          const priced = await Promise.all(alts.map(async a => {
+            const q = await withTimeout(
+              quoteForStay({ from: a.from, nights: intent.nights, dogs: 0 }),
+              2000,
+              () => ({ total: 0 } as any)
+            );
+            const priceTxt = q && typeof (q as any).total === 'number' && (q as any).total > 0 ? ` — ${fmtGBP((q as any).total)}` : '';
+            return `${a.from}${priceTxt}`;
+          }));
+          const answer = `❌ Sorry, those dates look unavailable.${priced.length ? ` Closest alternatives: ${priced.join(', ')}.` : ''}`;
           pushMessage(session, 'assistant', answer);
           return res.json({ answer });
         }
