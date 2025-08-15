@@ -1,7 +1,4 @@
 // src/rag.ts
-// Lightweight RAG: in-memory chunks, keyword ranking fallback, optional OpenAI
-// embeddings + LLM phrasing when OPENAI_API_KEY is present.
-
 const OPENAI_API_KEY = process.env.OPENAI_API_KEY || '';
 
 export type Chunk = {
@@ -11,40 +8,33 @@ export type Chunk = {
   embedding?: number[];
 };
 
-// Keep chunks across hot reloads/container lifetime
 export const chunks: Chunk[] = (global as any).__HC_CHUNKS__ ||= [];
 
-/** Initialize/refresh your content index (no-op placeholder for site crawling) */
-export async function refreshContentIndex(force = false): Promise<void> {
-  if (force) {
-    // If you later add a crawler, (re)populate `chunks` here.
-    console.log('[rag] refresh requested (no-op placeholder)');
-  }
+export async function refreshContentIndex(_force = false): Promise<void> {
+  // (no-op hook)
 }
 
-/** Simple id generator */
 function cryptoId(): string {
   return Math.random().toString(36).slice(2) + Date.now().toString(36);
 }
 
-/** Split plain text into ~1000 char chunks at paragraph boundaries */
 function splitIntoChunks(text: string, sourceUrl: string, maxLen = 1000): Chunk[] {
   const paras = text.split(/\n{2,}/g).map(s => s.trim()).filter(Boolean);
   const out: Chunk[] = [];
   let buf = '';
   for (const p of paras) {
-    if ((buf ? buf + '\n\n' : '').length + p.length > maxLen && buf) {
+    const next = buf ? `${buf}\n\n${p}` : p;
+    if (next.length > maxLen && buf) {
       out.push({ id: cryptoId(), url: sourceUrl, text: buf });
       buf = p;
     } else {
-      buf = buf ? buf + '\n\n' + p : p;
+      buf = next;
     }
   }
   if (buf) out.push({ id: cryptoId(), url: sourceUrl, text: buf });
   return out;
 }
 
-/** Cosine similarity between two equal-length vectors */
 function cosine(a: number[], b: number[]): number {
   let dot = 0, na = 0, nb = 0;
   const len = Math.min(a.length, b.length);
@@ -58,7 +48,6 @@ function cosine(a: number[], b: number[]): number {
   return dot / denom;
 }
 
-/** Keyword ranking fallback (no OpenAI needed) */
 function keywordRank(query: string, k = 6): Chunk[] {
   const terms = query.toLowerCase().split(/\W+/).filter(Boolean);
   const score = (t: string): number =>
@@ -71,7 +60,6 @@ function keywordRank(query: string, k = 6): Chunk[] {
     .map(({ c }) => c);
 }
 
-/** Batch embed texts with OpenAI (safe: returns [] on failure) */
 async function embedBatch(texts: string[]): Promise<number[][]> {
   if (!OPENAI_API_KEY) return [];
   try {
@@ -80,79 +68,67 @@ async function embedBatch(texts: string[]): Promise<number[][]> {
       headers: { 'Content-Type': 'application/json', Authorization: `Bearer ${OPENAI_API_KEY}` },
       body: JSON.stringify({ model: 'text-embedding-3-small', input: texts })
     });
-    if (!res.ok) {
-      return [];
-    }
+    if (!res.ok) return [];
     const j: any = await res.json();
     return (j.data as Array<{ embedding: number[] }>).map((row) => row.embedding);
-  } catch {
-    return [];
-  }
+  } catch { return []; }
 }
 
-/** Embed a single query */
 async function embedQuery(text: string): Promise<number[]> {
   const out = await embedBatch([text]);
   return out[0] || [];
 }
 
-/** Optional LLM phrasing over retrieved context (friendlier tone) */
-async function chatWithContext(prompt: string, context: string): Promise<string> {
+async function chatWithContext(prompt: string, context: string, history: Array<{ role: 'user'|'assistant'; content: string }>): Promise<string> {
   if (!OPENAI_API_KEY) return '';
   try {
+    const messages: any[] = [
+      {
+        role: 'system',
+        content:
+          "You are a friendly, concise holiday-cottage assistant. Prefer using the provided context. " +
+          "You see the recent conversation to keep continuity. " +
+          "If info isn't in context, say so briefly and suggest how the guest can proceed (e.g., provide dates, nights, dogs) " +
+          "or offer related info you do have. Keep replies short, clear, and helpful."
+      }
+    ];
+
+    // Add a short recent history window
+    for (const m of history.slice(-8)) {
+      messages.push({ role: m.role, content: m.content });
+    }
+
+    messages.push({ role: 'user', content: `Context:\n${context}\n\nQuestion: ${prompt}` });
+
     const res = await fetch('https://api.openai.com/v1/chat/completions', {
       method: 'POST',
       headers: { 'Content-Type': 'application/json', Authorization: `Bearer ${OPENAI_API_KEY}` },
-      body: JSON.stringify({
-        model: 'gpt-4o-mini',
-        temperature: 0.25,
-        messages: [
-          {
-            role: 'system',
-            content:
-              "You are a friendly, concise holiday-cottage assistant. Prefer using the provided context. " +
-              "If the info isn't in context, say so briefly and suggest how the guest can ask (e.g., provide dates, nights, dogs) " +
-              "or offer related info you do have. Keep replies short, clear, and helpful."
-          },
-          { role: 'user', content: `Context:\n${context}\n\nQuestion: ${prompt}` }
-        ]
-      })
+      body: JSON.stringify({ model: 'gpt-4o-mini', temperature: 0.25, messages })
     });
     if (!res.ok) return '';
     const j: any = await res.json();
     return j.choices?.[0]?.message?.content || '';
-  } catch {
-    return '';
-  }
+  } catch { return ''; }
 }
 
-/** Public: add external document (e.g., PDF/WEB) into the index (with optional embeddings) */
 export async function addExternalDocumentToIndex(title: string, sourceUrl: string, text: string): Promise<{ added: number; title: string; sourceUrl: string }> {
   const newChunks = splitIntoChunks(text, sourceUrl);
-
-  if (OPENAI_API_KEY && newChunks.length) {
-    const vecs = await embedBatch(newChunks.map((c) => c.text));
-    if (vecs.length === newChunks.length) {
-      for (let i = 0; i < newChunks.length; i++) {
-        newChunks[i].embedding = vecs[i];
-      }
-    }
+  const vecs = await embedBatch(newChunks.map((c) => c.text));
+  if (vecs.length === newChunks.length) {
+    for (let i = 0; i < newChunks.length; i++) newChunks[i].embedding = vecs[i];
   }
-
   chunks.push(...newChunks);
   return { added: newChunks.length, title, sourceUrl };
 }
 
-/** Answer a user query with RAG. */
-export async function answerWithContext(message: string): Promise<{ answer: string; sources?: string[]; context?: Array<{ url: string; snippet: string }> }> {
-  if (chunks.length === 0) {
-    console.log('[rag] no chunks loaded; returning snippets fallback');
-  }
+export async function answerWithContext(
+  message: string,
+  history: Array<{ role: 'user'|'assistant'; content: string }> = []
+): Promise<{ answer: string; sources?: string[]; context?: Array<{ url: string; snippet: string }> }> {
 
   let top: Chunk[] = [];
+  const haveEmbeddings = chunks.some((c) => Array.isArray(c.embedding) && c.embedding.length > 0);
 
-  // Prefer embedding search if we have embeddings AND an API key
-  const haveEmbeddings = OPENAI_API_KEY && chunks.some((c) => Array.isArray(c.embedding) && c.embedding.length > 0);
   if (haveEmbeddings) {
     try {
       const qvec = await embedQuery(message);
@@ -164,27 +140,21 @@ export async function answerWithContext(message: string): Promise<{ answer: stri
           .slice(0, 6)
           .map(({ c }) => c);
       }
-    } catch {
-      // fall back to keywords below
-    }
+    } catch { /* fallback to keywords */ }
   }
 
-  if (top.length === 0) {
-    top = keywordRank(message, 6);
-  }
+  if (top.length === 0) top = keywordRank(message, 6);
 
   const contextBlocks = top.map((t) => `From ${t.url}:\n${t.text}`).join('\n---\n');
 
-  // If API key is present, try to produce a nicely phrased answer
   if (OPENAI_API_KEY) {
-    const txt = await chatWithContext(message, contextBlocks);
+    const txt = await chatWithContext(message, contextBlocks, history);
     if (txt) {
       const uniqueSources = Array.from(new Set(top.map((t) => t.url)));
       return { answer: txt, sources: uniqueSources };
     }
   }
 
-  // Snippet-only fallback (no LLM)
   if (top.length === 0) {
     return {
       answer:
