@@ -22,7 +22,7 @@ app.use(express.json({ limit: '1mb' }));
 const allowed = (process.env.ALLOWED_ORIGIN || '').split(',').map(s => s.trim()).filter(Boolean);
 app.use(cors({
   origin(origin, cb) {
-    if (!origin) return cb(null, true); // allow curl/local tools
+    if (!origin) return cb(null, true); // allow curl/local tools and file://
     if (allowed.includes('*') || allowed.includes(origin)) return cb(null, true);
     return cb(new Error('Not allowed by CORS'));
   }
@@ -70,21 +70,72 @@ app.post('/api/quote', (req, res) => {
   res.json(quoteForStay(parsed.data));
 });
 
-/* ---------- Booking intent gate ---------- */
-function isBookingLike(message: string): boolean {
-  const txt = message.toLowerCase();
-  const bookingWords = [
-    'available','availability','book','booking','reserve','reservation',
-    'price','pricing','cost','quote','deposit',
-    'night','nights','week','weekend','dogs','dog',
-    'check-in','check in','checkout','check-out'
-  ];
-  if (bookingWords.some(w => txt.includes(w))) return true;
-  if (/\b\d{4}-\d{2}-\d{2}\b/.test(txt)) return true;
-  if (/\bfrom\b.*\b(to|until)\b/.test(txt)) return true;
-  if (/\bnext\s+(mon|tue|wed|thu|fri|sat|sun|monday|tuesday|wednesday|thursday|friday|saturday|sunday)\b/.test(txt)) return true;
-  if (/\bthis\s+(mon|tue|wed|thu|fri|sat|sun|monday|tuesday|wednesday|thursday|friday|saturday|sunday|weekend)\b/.test(txt)) return true;
+/* ---------- Booking intent helpers ---------- */
+// Stricter heuristic: requires a booking verb or explicit date/range.
+// Pet/fence/garden words alone should NOT trigger booking flow.
+function hasDateHints(t: string): boolean {
+  return (
+    /\b\d{4}-\d{2}-\d{2}\b/.test(t) ||                                   // ISO date
+    /\bfrom\b.*\b(to|until)\b/.test(t) ||                                 // from X to Y
+    /\bfor\s+\d+\s+nights?\b/.test(t) ||                                  // for 3 nights
+    /\b\d+\s+nights?\b/.test(t) ||                                        // 3 nights
+    /\b(next|this)\s+(mon|tue|wed|thu|fri|sat|sun|monday|tuesday|wednesday|thursday|friday|saturday|sunday|weekend)\b/.test(t)
+  );
+}
+
+function isBookingLikeHeuristic(message: string): boolean {
+  const t = message.toLowerCase();
+
+  const bookingVerbs =
+    /\b(book|booking|reserve|reservation|availability|available|price|pricing|cost|quote|deposit|rate|rates)\b/;
+
+  // Clearly informational pet/garden queries should NOT trigger booking flow unless they also have dates/booking verbs
+  const petGarden =
+    /\b(dog|dogs|pet|pets|fence|fenced|garden|yard|gate|secure|safety|enclosure|lawn|grass)\b/;
+
+  if (petGarden.test(t) && !bookingVerbs.test(t) && !hasDateHints(t)) {
+    return false;
+  }
+
+  // Booking if explicit verb or any date/range hint
+  if (bookingVerbs.test(t)) return true;
+  if (hasDateHints(t)) return true;
+
   return false;
+}
+
+// Optional: small LLM intent classifier. Falls back to heuristic if API not available.
+async function classifyIntentLLM(message: string): Promise<'booking' | 'info' | 'unknown'> {
+  if (!process.env.OPENAI_API_KEY) return 'unknown';
+  try {
+    const res = await fetch('https://api.openai.com/v1/chat/completions', {
+      method: 'POST',
+      headers: {
+        'Content-Type': 'application/json',
+        Authorization: `Bearer ${process.env.OPENAI_API_KEY}`
+      },
+      body: JSON.stringify({
+        model: 'gpt-4o-mini',
+        temperature: 0,
+        messages: [
+          {
+            role: 'system',
+            content:
+              'Classify the user message as "booking" (asks about dates, prices, availability, or making a reservation) or "info" (general questions about the property, pets, garden, rules, amenities, area). Reply with ONLY "booking" or "info".'
+          },
+          { role: 'user', content: message }
+        ]
+      })
+    });
+    if (!res.ok) return 'unknown';
+    const j: any = await res.json();
+    const label = String(j.choices?.[0]?.message?.content || '').toLowerCase().trim();
+    if (label.includes('booking')) return 'booking';
+    if (label.includes('info')) return 'info';
+    return 'unknown';
+  } catch {
+    return 'unknown';
+  }
 }
 
 /* ---------- Chat ---------- */
@@ -95,8 +146,19 @@ app.post('/api/chat', async (req, res) => {
 
   const message = parsed.data.message;
 
-  // Only run the booking/availability flow if booking-like; else use RAG
-  if (isBookingLike(message)) {
+  // Decide booking intent: try LLM (if available), otherwise heuristic
+  let bookingIntent = false;
+  try {
+    const label = await classifyIntentLLM(message);
+    if (label === 'booking') bookingIntent = true;
+    else if (label === 'info') bookingIntent = false;
+    else bookingIntent = isBookingLikeHeuristic(message);
+  } catch {
+    bookingIntent = isBookingLikeHeuristic(message);
+  }
+
+  // Booking/availability flow
+  if (bookingIntent) {
     try {
       const intent = await interpretMessageWithLLM(message);
       if (intent.kind === 'dates') {
@@ -112,6 +174,7 @@ app.post('/api/chat', async (req, res) => {
           return res.json({ answer: `❌ Sorry, those dates look unavailable.${alts ? ` Closest alternatives: ${alts}.` : ''}` });
         }
       }
+      // If LLM didn't produce dates, drop to RAG
     } catch (e) {
       console.warn('[chat] LLM extract failed — falling back to RAG:', (e as any)?.message || e);
     }
