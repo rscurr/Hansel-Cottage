@@ -1,6 +1,6 @@
 // src/ics.ts
 import ical from 'node-ical';
-import { addDays, isBefore, isAfter, parseISO } from 'date-fns';
+import { addDays, isBefore, isAfter, parseISO, startOfMonth, endOfMonth } from 'date-fns';
 
 type Booking = { start: string; end: string; summary?: string };
 
@@ -69,22 +69,56 @@ function toIso(d: Date | string): string {
 export function isRangeAvailable(fromISO: string, nights: number): boolean {
   const start = parseISO(fromISO);
   const end = addDays(start, nights);
+
   for (const b of bookings) {
     const bStart = parseISO(b.start);
     const bEnd = parseISO(b.end);
-    // overlap if start < bEnd AND end > bStart
-    if (isBefore(start, bEnd) && isAfter(end, bStart)) return false;
+    // Overlap if start < bEnd AND end > bStart
+    const overlaps = isBefore(start, bEnd) && isAfter(end, bStart);
+    if (overlaps) return false;
   }
   return true;
 }
 
 export function suggestAlternatives(fromISO: string, nights: number, max = 10) {
   const suggestions: Array<{ from: string; nights: number }> = [];
-  const base = parseISO(fromISO);
+  const start = parseISO(fromISO);
+
+  // Try the next 60 days for an open stretch
   for (let i = 1; i <= 60 && suggestions.length < max; i++) {
-    const cand = addDays(base, i);
-    const candISO = cand.toISOString().slice(0, 10);
-    if (isRangeAvailable(candISO, nights)) suggestions.push({ from: candISO, nights });
+    const candStart = addDays(start, i);
+    const candISO = toIso(candStart as any);
+    if (isRangeAvailable(candISO, nights)) {
+      suggestions.push({ from: candISO, nights });
+    }
   }
   return suggestions;
+}
+
+/**
+ * Find all available start dates between rangeStartISO and rangeEndISO (inclusive) that fit `nights`.
+ * Scans day-by-day and returns up to `max` options.
+ */
+export function findAvailabilityInRange(rangeStartISO: string, rangeEndISO: string, nights: number, max = 20) {
+  const out: Array<{ from: string; nights: number }> = [];
+  let d = parseISO(rangeStartISO);
+  const last = parseISO(rangeEndISO);
+  // We can start no later than (last - nights)
+  while (isBefore(d, addDays(last, 1)) && out.length < max) {
+    const iso = toIso(d);
+    if (isRangeAvailable(iso, nights)) out.push({ from: iso, nights });
+    d = addDays(d, 1);
+  }
+  return out;
+}
+
+/**
+ * Convenience: find availability within a given month (1-12) of a year for `nights`.
+ */
+export function findAvailabilityInMonth(year: number, month1to12: number, nights: number, max = 20) {
+  const first = startOfMonth(new Date(Date.UTC(year, month1to12 - 1, 1)));
+  const last = endOfMonth(first);
+  const startISO = toIso(first);
+  const endISO = toIso(last);
+  return findAvailabilityInRange(startISO, endISO, nights, max);
 }
