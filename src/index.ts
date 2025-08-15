@@ -25,7 +25,8 @@ import {
   initSessionSweeper,
   getSession,
   pushMessage,
-  getRecentMessages
+  getRecentMessages,
+  type SessionMem
 } from './session.js';
 
 const app = express();
@@ -210,6 +211,12 @@ function wantsPrevious(t: string) {
   return /\bprev(ious)?\b/.test(t);
 }
 
+/* ---------- simple extractors ---------- */
+function extractIsoDate(message: string): string | null {
+  const m = message.match(/\b(\d{4}-\d{2}-\d{2})\b/);
+  return m ? m[1] : null;
+}
+
 /* ---------- helpers: price peek with timeout ---------- */
 async function withTimeout<T>(p: Promise<T>, ms = 2000, onTimeout: () => T): Promise<T> {
   let to: NodeJS.Timeout;
@@ -218,7 +225,6 @@ async function withTimeout<T>(p: Promise<T>, ms = 2000, onTimeout: () => T): Pro
     new Promise<T>(resolve => { to = setTimeout(() => resolve(onTimeout()), ms); })
   ]);
 }
-
 function fmtGBP(n: number): string {
   return `£${(Math.round(n * 100) / 100).toFixed(2)}`;
 }
@@ -242,11 +248,45 @@ app.post('/api/chat', async (req, res) => {
     return res.json({ answer });
   }
 
-  // 2) Handle pending follow-ups FIRST (nearby months)
-  if (session.pending?.kind === 'ask-nearby-months') {
-    let { year, month, nights } = session.pending;
+  // 2a) If user just picked a date (after we listed options), respect the pending nights
+  if (session.pending?.kind === 'awaiting-date-pick') {
+    const picked = extractIsoDate(message);
+    if (picked) {
+      const nights = session.pending.nights || session.prefs?.lastRequestedNights || 7;
+      session.pending = undefined;
+      // also remember preference
+      session.prefs = session.prefs || {};
+      session.prefs.lastRequestedNights = nights;
 
-    // parse tweaks in follow-up
+      const available = isRangeAvailable(picked, nights);
+      if (available) {
+        const q = await quoteForStay({ from: picked, nights, dogs: 0 });
+        const answer = `✅ Available from ${picked} for ${nights} night(s). Estimated total: ${q.currency} ${q.total}. Would you like the booking link?`;
+        pushMessage(session, 'assistant', answer);
+        return res.json({ answer });
+      } else {
+        const alts = suggestAlternatives(picked, nights, 6).slice(0, 5);
+        const priced = await Promise.all(alts.map(async a => {
+          const q = await withTimeout(
+            quoteForStay({ from: a.from, nights, dogs: 0 }),
+            2000,
+            () => ({ total: 0 } as any)
+          );
+          const priceTxt = q && typeof (q as any).total === 'number' && (q as any).total > 0 ? ` — ${fmtGBP((q as any).total)}` : '';
+          return `${a.from}${priceTxt}`;
+        }));
+        const answer = `❌ Sorry, those dates look unavailable.${priced.length ? ` Closest alternatives: ${priced.join(', ')}.` : ''}`;
+        pushMessage(session, 'assistant', answer);
+        return res.json({ answer });
+      }
+    }
+    // If no date found, fall through to normal handling (the user might have typed a new query)
+  }
+
+  // 2b) Handle pending nearby-month flow
+  if ((session.pending as any)?.kind === 'ask-nearby-months') {
+    let { year, month, nights } = session.pending as any;
+
     const mm = extractMonthYearFromText(message);
     if (mm.month) month = mm.month!;
     if (mm.year) year = mm.year!;
@@ -274,9 +314,11 @@ app.post('/api/chat', async (req, res) => {
       }
 
       if (results.length) {
-        session.pending = undefined;
+        // remember preference
+        session.prefs = session.prefs || {};
+        session.prefs.lastRequestedNights = nights;
 
-        // Attach price peeks (first 5 per bucket to keep it snappy)
+        // Price the first few and set pending date pick
         const bullets: string[] = [];
         for (const r of results) {
           const niceMonth = MONTHS[r.month - 1][0].toUpperCase() + MONTHS[r.month - 1].slice(1);
@@ -285,7 +327,7 @@ app.post('/api/chat', async (req, res) => {
             const q = await withTimeout(
               quoteForStay({ from: o.from, nights: r.nights, dogs: 0 }),
               2000,
-              () => ({ total: 0, currency: 'GBP', from: o.from, nights: r.nights, dogs: 0, lineItems: [], subtotal: 0, tax: 0, nightly: [] } as any)
+              () => ({ total: 0 } as any)
             );
             const priceTxt = q && typeof (q as any).total === 'number' && (q as any).total > 0 ? ` — ${fmtGBP((q as any).total)}` : '';
             return `• ${o.from} (${r.nights} nights)${priceTxt}`;
@@ -293,7 +335,11 @@ app.post('/api/chat', async (req, res) => {
           bullets.push(`**${niceMonth} ${r.year}**\n` + priced.join('\n'));
         }
 
-        const answer = `Here are options I found:\n\n${bullets.join('\n\n')}\n\nTell me which date you prefer, or say "next" to see the following month.`;
+        // set pending date pick for the nights we just listed
+        const chosen = results[0]!;
+        session.pending = { kind: 'awaiting-date-pick', nights: chosen.nights };
+
+        const answer = `Here are options I found:\n\n${bullets.join('\n\n')}\n\nTell me which date you prefer (e.g., 2026-04-30), or say "next" to see the following month.`;
         pushMessage(session, 'assistant', answer);
         return res.json({ answer });
       } else {
@@ -310,9 +356,13 @@ app.post('/api/chat', async (req, res) => {
   const flex = parseMonthAvailabilityRequest(message);
   if (flex) {
     const { year, month, nights } = flex;
+
+    // remember preference
+    session.prefs = session.prefs || {};
+    session.prefs.lastRequestedNights = nights;
+
     const options = findAvailabilityInMonth(year, month, nights, 20);
     if (options.length) {
-      // Price the first 8 to keep latency reasonable
       const first = options.slice(0, 8);
       const priced = await Promise.all(first.map(async o => {
         const q = await withTimeout(
@@ -324,10 +374,14 @@ app.post('/api/chat', async (req, res) => {
         return `• ${o.from} (${nights} nights)${priceTxt}`;
       }));
       const niceMonth = MONTHS[month-1][0].toUpperCase()+MONTHS[month-1].slice(1);
+
+      // set pending date pick for the nights we just listed
+      session.pending = { kind: 'awaiting-date-pick', nights };
+
       const answer =
         `Here are the available start dates in ${niceMonth} ${year} for ${nights} night(s):\n` +
         priced.join('\n') +
-        `\n\nTell me which one you’d like and I can price it in full and give you booking steps.`;
+        `\n\nTell me which one you’d like (e.g., 2026-04-30) and I’ll price it and give you booking steps.`;
       pushMessage(session, 'assistant', answer);
       return res.json({ answer });
     } else {
@@ -348,37 +402,55 @@ app.post('/api/chat', async (req, res) => {
     bookingIntent = isBookingLikeHeuristic(message);
   }
 
-  // 5) Booking flow for specific dates
-  if (bookingIntent) {
+  // 5) Booking flow for specific dates or date-only replies
+  if (bookingIntent || extractIsoDate(message)) {
     try {
-      const intent = await interpretMessageWithLLM(message);
-      if (intent.kind === 'dates') {
-        const available = isRangeAvailable(intent.from, intent.nights);
+      const dateOnly = extractIsoDate(message);
+      let requestedFrom = dateOnly || '';
+      let requestedNights = session.prefs?.lastRequestedNights || 7;
+
+      let intent: any = null;
+      if (!dateOnly) {
+        intent = await interpretMessageWithLLM(message);
+        if (intent?.kind === 'dates') {
+          requestedFrom = intent.from;
+          requestedNights = intent.nights || requestedNights;
+          // remember preference
+          session.prefs = session.prefs || {};
+          session.prefs.lastRequestedNights = requestedNights;
+        }
+      }
+
+      if (requestedFrom) {
+        const available = isRangeAvailable(requestedFrom, requestedNights);
         if (available) {
-          const q = await quoteForStay({ from: intent.from, nights: intent.nights, dogs: 0 });
-          const answer = `✅ Available from ${intent.from} for ${intent.nights} night(s). Estimated total: ${q.currency} ${q.total}. Would you like the booking link?`;
+          const q = await quoteForStay({ from: requestedFrom, nights: requestedNights, dogs: 0 });
+          const answer = `✅ Available from ${requestedFrom} for ${requestedNights} night(s). Estimated total: ${q.currency} ${q.total}. Would you like the booking link?`;
           pushMessage(session, 'assistant', answer);
           return res.json({ answer });
         } else {
-          const alts = suggestAlternatives(intent.from, intent.nights, 6).slice(0, 5);
-          // Price peeks for alternatives
+          const alts = suggestAlternatives(requestedFrom, requestedNights, 6).slice(0, 5);
           const priced = await Promise.all(alts.map(async a => {
             const q = await withTimeout(
-              quoteForStay({ from: a.from, nights: intent.nights, dogs: 0 }),
+              quoteForStay({ from: a.from, nights: requestedNights, dogs: 0 }),
               2000,
               () => ({ total: 0 } as any)
             );
             const priceTxt = q && typeof (q as any).total === 'number' && (q as any).total > 0 ? ` — ${fmtGBP((q as any).total)}` : '';
             return `${a.from}${priceTxt}`;
           }));
+
+          // set pending date pick to keep nights sticky if they choose an alternative
+          session.pending = { kind: 'awaiting-date-pick', nights: requestedNights };
+
           const answer = `❌ Sorry, those dates look unavailable.${priced.length ? ` Closest alternatives: ${priced.join(', ')}.` : ''}`;
           pushMessage(session, 'assistant', answer);
           return res.json({ answer });
         }
       }
-      // If LLM didn't produce dates, fall through to RAG
+      // If we got here without a date, fall through to RAG
     } catch (e) {
-      console.warn('[chat] LLM extract failed — falling back to RAG:', (e as any)?.message || e);
+      console.warn('[chat] date-intent failed — falling back to RAG:', (e as any)?.message || e);
     }
   }
 
