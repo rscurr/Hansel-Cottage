@@ -27,11 +27,9 @@ export async function fromSitemap(sitemapUrl: string): Promise<string[]> {
   const xml = await fetchGzAware(sitemapUrl);
   const parsed = await parseStringPromise(xml);
   const urls: string[] = [];
-  if (parsed?.urlset?.url) {
-    for (const u of parsed.urlset.url) if (u.loc?.[0]) urls.push(u.loc[0]);
-  }
+  if (parsed?.urlset?.url) for (const u of parsed.urlset.url) if (u.loc?.[0]) urls.push(u.loc[0]);
   if (parsed?.sitemapindex?.sitemap) {
-    for (const s of parsed.sitemapindex.sitemap) if (s.loc?.[0]) {
+    for (const s of parsed.sitemapindex?.sitemap) if (s.loc?.[0]) {
       const inner = await fromSitemap(s.loc[0]);
       urls.push(...inner);
     }
@@ -45,12 +43,13 @@ export async function extractReadableText(html: string, baseUrl: string): Promis
   // Remove boilerplate
   $('script,noscript,style,svg,nav,footer,header,form,iframe').remove();
 
-  // Prefer main/article content
-  const root = $('main,article').first().length ? $('main,article').first() : $.root();
+  // Prefer <main>/<article>, else fall back to <body> (typed as Cheerio<Element>)
+  const preferred = $('main,article').first();
+  const root = preferred.length ? preferred : $('body');
 
   // Gather headings/paragraph-like blocks
   const blocks: string[] = [];
-  root.find('h1,h2,h3,h4,h5,h6,p,li,dt,dd,blockquote').each((_, el) => {
+  root.find('h1,h2,h3,h4,h5,h6,p,li,dt,dd,blockquote').each((_i, el) => {
     const t = $(el).text().replace(/\s+/g, ' ').trim();
     if (t) blocks.push(t);
   });
@@ -58,12 +57,12 @@ export async function extractReadableText(html: string, baseUrl: string): Promis
 
   // Same-origin links for crawling
   const links = new Set<string>();
-  root.find('a[href]').each((_, el) => {
+  root.find('a[href]').each((_i, el) => {
     const href = $(el).attr('href') || '';
     try {
       const abs = new URL(href, baseUrl).toString();
       if (sameOrigin(abs, baseUrl) && !isBinary(abs)) links.add(norm(abs));
-    } catch {}
+    } catch { /* ignore bad URLs */ }
   });
 
   return { text, links: Array.from(links) };
