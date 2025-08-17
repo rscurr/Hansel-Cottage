@@ -3,7 +3,7 @@
 // Hansel Cottage chatbot server (compat mode).
 // - ICS scan + Bookalet price validation
 // - RAG for PDFs/site
-// - Flexible narrowing follow-ups (see parser below)
+// - Flexible narrowing follow-ups (weekday/ordinal/ranges/around/next/previous)
 // - Accepts {message}|{text}|{question}; optional conversationId (auto if missing)
 // - Returns {answer, reply, message, text, success, history}
 // - /chat and /api/chat routes
@@ -122,8 +122,8 @@ type NarrowFilter =
   | { kind: 'around'; day: number; dow?: number } // ±3 days, optional weekday
   | { kind: 'dayrange'; lo: number; hi: number }  // inclusive
   | { kind: 'weeknum'; n: 1|2|3|4|5 }             // week blocks (1:1-7, 2:8-14, 3:15-21, 4:22-28, 5:29-31)
-  | { kind: 'nthWeekday'; n: 1|2|3|4|5; dow: number } // e.g., second Friday (by day bucket)
-  | { kind: 'next' } | { kind: 'previous' }       // month navigation during narrowing
+  | { kind: 'nthWeekday'; n: 1|2|3|4|5; dow: number } // e.g., second Friday
+  | { kind: 'next' } | { kind: 'previous' }       // <<< INCLUDED to fix TS error
   | { kind: 'date'; date: string };
 
 function parseOrdinalWord(t: string): 1|2|3|4|5|null {
@@ -133,12 +133,6 @@ function parseOrdinalWord(t: string): 1|2|3|4|5|null {
   if (/\b(fourth|4th)\b/.test(t)) return 4;
   if (/\b(fifth|5th)\b/.test(t)) return 5;
   return null;
-}
-function parseDayNumber(t: string): number | null {
-  const m = t.match(/\b(\d{1,2})(?:st|nd|rd|th)?\b/);
-  if (!m) return null;
-  const d = parseInt(m[1], 10);
-  return (d >= 1 && d <= 31) ? d : null;
 }
 
 function parseNarrowing(msg: string): NarrowFilter | null {
@@ -254,7 +248,6 @@ function applyNarrowingFilter(dates: Array<{ from: string; price: number }>, f: 
       return byDay(day => day >= lo && day <= hi);
     }
     case 'nthWeekday': {
-      // bucket by day ranges like the weeknum and intersect weekday
       const ranges: Record<number, [number, number]> = {
         1: [1, 7], 2: [8, 14], 3: [15, 21], 4: [22, 28], 5: [29, 31]
       };
@@ -268,7 +261,7 @@ function applyNarrowingFilter(dates: Array<{ from: string; price: number }>, f: 
     }
     case 'next':
     case 'previous':
-      // handled at call-site (month navigation), not here
+      // handled upstream (month navigation)
       return dates;
   }
 }
