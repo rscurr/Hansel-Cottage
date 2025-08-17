@@ -122,32 +122,8 @@ function isBookingLikeHeuristic(message: string): boolean {
   if (hasDateHints(t)) return true;
   return false;
 }
-async function classifyIntentLLM(
-  message: string,
-  history: Array<{role:'user'|'assistant',content:string}>
-): Promise<'booking'|'info'|'unknown'> {
-  if (!process.env.OPENAI_API_KEY) return 'unknown';
-  try {
-    const messages = [
-      { role: 'system', content: 'Classify as "booking" (dates/prices/reservation) or "info" (general property questions). Reply ONLY "booking" or "info". Consider the recent conversation.' },
-      ...history.slice(-6),
-      { role: 'user', content: message }
-    ];
-    const res = await fetch('https://api.openai.com/v1/chat/completions', {
-      method: 'POST',
-      headers: { 'Content-Type': 'application/json', Authorization: `Bearer ${process.env.OPENAI_API_KEY}` },
-      body: JSON.stringify({ model: 'gpt-4o-mini', temperature: 0, messages })
-    });
-    if (!res.ok) return 'unknown';
-    const j: any = await res.json();
-    const label = String(j.choices?.[0]?.message?.content || '').toLowerCase().trim();
-    if (label.includes('booking')) return 'booking';
-    if (label.includes('info')) return 'info';
-    return 'unknown';
-  } catch { return 'unknown'; }
-}
 
-/* ---------- Flexible month availability ---------- */
+/* ---------- Month parsing ---------- */
 const MONTHS = ['january','february','march','april','may','june','july','august','september','october','november','december'];
 
 function extractMonthYearFromText(message: string): { year?: number; month?: number } {
@@ -165,7 +141,6 @@ function extractMonthYearFromText(message: string): { year?: number; month?: num
   }
   return { year, month };
 }
-
 function extractNightsFromText(message: string): number | undefined {
   const t = message.toLowerCase();
   if (/\b(a\s+week|one\s+week|1\s+week)\b/.test(t)) return 7;
@@ -177,16 +152,6 @@ function extractNightsFromText(message: string): number | undefined {
   if (/\b(long\s+weekend)\b/.test(t)) return 3;
   return undefined;
 }
-
-// STRICT extractor: only “for N nights” (avoids catching years etc.)
-function extractExplicitNightsStrict(message: string): number | undefined {
-  const m = message.toLowerCase().match(/\bfor\s+(\d{1,2})\s+nights?\b/);
-  if (!m) return undefined;
-  const n = parseInt(m[1], 10);
-  if (Number.isFinite(n) && n >= 1 && n <= 30) return n;
-  return undefined;
-}
-
 function parseMonthAvailabilityRequest(message: string): { year: number; month: number; nights: number } | null {
   const t = message.toLowerCase();
   const mm = extractMonthYearFromText(t);
@@ -196,34 +161,18 @@ function parseMonthAvailabilityRequest(message: string): { year: number; month: 
   return { year: mm.year!, month: mm.month!, nights };
 }
 
-/* ---------- Robust follow-up helpers ---------- */
-function isNegative(raw: string) {
-  let t = raw.trim().toLowerCase().replace(/[!.\s]+$/g, '');
-  return (
-    /^n$/.test(t) ||
-    /\b(no|nope|nah|not now|cancel|stop|don’t|do not|rather not|no thanks|no thank you)\b/.test(t)
-  );
-}
-function isAffirmative(raw: string) {
-  let t = raw.trim().toLowerCase().replace(/[!.\s]+$/g, '');
-  if (isNegative(t)) return false;
-  if (/\b(yes|yeah|yep|yup|sure|certainly|absolutely|of course|please do|go ahead|do it|ok|okay|alright|all right|sounds good|that works|that would be great|yes please|yes please do|yes go ahead|yes do)\b/.test(t)) return true;
-  return /^y$/.test(t);
-}
-function wantsNext(t: string) {
-  t = t.trim().toLowerCase();
-  return /\bnext\b/.test(t);
-}
-function wantsPrevious(t: string) {
-  t = t.trim().toLowerCase();
-  return /\bprev(ious)?\b/.test(t);
-}
+/* ---------- Simple extractors & helpers ---------- */
 function extractIsoDate(message: string): string | null {
   const m = message.match(/\b(\d{4}-\d{2}-\d{2})\b/);
   return m ? m[1] : null;
 }
-
-/* ---------- helpers: price peek with timeout ---------- */
+function extractExplicitNightsStrict(message: string): number | undefined {
+  const m = message.toLowerCase().match(/\bfor\s+(\d{1,2})\s+nights?\b/);
+  if (!m) return undefined;
+  const n = parseInt(m[1], 10);
+  if (Number.isFinite(n) && n >= 1 && n <= 30) return n;
+  return undefined;
+}
 async function withTimeout<T>(p: Promise<T>, ms = 2000, onTimeout: () => T): Promise<T> {
   let to: NodeJS.Timeout;
   return await Promise.race([
@@ -233,6 +182,44 @@ async function withTimeout<T>(p: Promise<T>, ms = 2000, onTimeout: () => T): Pro
 }
 function fmtGBP(n: number): string {
   return `£${(Math.round(n * 100) / 100).toFixed(2)}`;
+}
+
+/* ---------- Price gating for options ---------- */
+/** small LRU-ish cache to avoid repeated quoting while filtering */
+const PRICE_CACHE = new Map<string, { when: number; total: number }>();
+const PRICE_TTL = 60 * 1000; // 60s
+
+async function getPriceTotal(from: string, nights: number): Promise<number> {
+  const key = `${from}|${nights}`;
+  const now = Date.now();
+  const hit = PRICE_CACHE.get(key);
+  if (hit && (now - hit.when) < PRICE_TTL) return hit.total;
+
+  const q = await withTimeout(
+    quoteForStay({ from, nights, dogs: 0 }),
+    2500,
+    () => ({ total: 0 } as any)
+  );
+  const total = (q && typeof (q as any).total === 'number') ? (q as any).total : 0;
+  PRICE_CACHE.set(key, { when: now, total });
+  return total;
+}
+
+/**
+ * Filter availability options to those that Bookalet can price (total > 0).
+ * Limits how many we probe to keep latency predictable.
+ */
+async function filterOptionsWithPrice(
+  options: Array<{ from: string; nights: number }>,
+  nights: number,
+  probeLimit = 24
+): Promise<Array<{ from: string; nights: number; total: number }>> {
+  const subset = options.slice(0, probeLimit);
+  const priced = await Promise.all(subset.map(async o => {
+    const total = await getPriceTotal(o.from, nights);
+    return { from: o.from, nights, total };
+  }));
+  return priced.filter(p => p.total > 0);
 }
 
 /* ---------- Chat ---------- */
@@ -254,14 +241,14 @@ app.post('/api/chat', async (req, res) => {
     return res.json({ answer });
   }
 
-  // 2) Pending: awaiting date pick (keeps listed nights)
-  if (session.pending?.kind === 'awaiting-date-pick') {
+  // 2) Pending date pick: keep nights sticky
+  if ((session as any).pending?.kind === 'awaiting-date-pick') {
     const picked = extractIsoDate(message);
     if (picked) {
-      const nights = session.pending.nights;
-      session.pending = undefined;
-      session.prefs = session.prefs || {};
-      session.prefs.lastRequestedNights = nights;
+      const nights = (session as any).pending.nights;
+      (session as any).pending = undefined;
+      (session as any).prefs = (session as any).prefs || {};
+      (session as any).prefs.lastRequestedNights = nights;
 
       const available = isRangeAvailable(picked, nights);
       if (available) {
@@ -270,27 +257,19 @@ app.post('/api/chat', async (req, res) => {
         pushMessage(session, 'assistant', answer);
         return res.json({ answer });
       } else {
-        const alts = suggestAlternatives(picked, nights, 6).slice(0, 5);
-        const priced = await Promise.all(alts.map(async a => {
-          const q = await withTimeout(
-            quoteForStay({ from: a.from, nights, dogs: 0 }),
-            2000,
-            () => ({ total: 0 } as any)
-          );
-          const priceTxt = q && typeof (q as any).total === 'number' && (q as any).total > 0 ? ` — ${fmtGBP((q as any).total)}` : '';
-          return `${a.from}${priceTxt}`;
-        }));
+        const alts = suggestAlternatives(picked, nights, 12).slice(0, 10);
+        const filtered = await filterOptionsWithPrice(alts, nights, 10);
+        const priced = filtered.map(a => `${a.from} — ${fmtGBP(a.total)}`);
         const answer = `❌ Sorry, those dates look unavailable.${priced.length ? ` Closest alternatives: ${priced.join(', ')}.` : ''}`;
         pushMessage(session, 'assistant', answer);
         return res.json({ answer });
       }
     }
-    // if they didn't send a date, keep going (they may have asked a new question)
   }
 
   // 3) Nearby-month follow-ups
-  if ((session.pending as any)?.kind === 'ask-nearby-months') {
-    let { year, month, nights } = session.pending as any;
+  if ((session as any).pending?.kind === 'ask-nearby-months') {
+    let { year, month, nights } = (session as any).pending;
 
     const mm = extractMonthYearFromText(message);
     if (mm.month) month = mm.month!;
@@ -298,60 +277,36 @@ app.post('/api/chat', async (req, res) => {
     const n2 = extractNightsFromText(message);
     if (typeof n2 === 'number') nights = n2;
 
-    if (wantsNext(message)) { month += 1; if (month > 12) { month = 1; year += 1; } }
-    if (wantsPrevious(message)) { month -= 1; if (month < 1) { month = 12; year -= 1; } }
+    if (/^\s*next\s*$/i.test(message)) { month += 1; if (month > 12) { month = 1; year += 1; } }
+    if (/^\s*prev(ious)?\s*$/i.test(message)) { month -= 1; if (month < 1) { month = 12; year -= 1; } }
 
-    if (isNegative(message)) {
-      session.pending = undefined;
+    if (/\b(no|nope|nah|not now|cancel|stop)\b/i.test(message)) {
+      (session as any).pending = undefined;
       const answer = "No problem. Would you like me to search a different month or a different length of stay?";
       pushMessage(session, 'assistant', answer);
       return res.json({ answer });
     }
 
-    if (isAffirmative(message) || wantsNext(message) || wantsPrevious(message) || mm.month || typeof n2 === 'number') {
-      const monthsToScan = isAffirmative(message) && !mm.month && typeof n2 !== 'number' ? [0, 1, 2] : [0];
-      const results: Array<{ year: number; month: number; nights: number; options: Array<{ from: string; nights: number }> }> = [];
-      for (const delta of monthsToScan) {
-        let y = year, m = month + delta;
-        while (m > 12) { m -= 12; y += 1; }
-        const opts = findAvailabilityInMonth(y, m, nights, 20);
-        if (opts.length) results.push({ year: y, month: m, nights, options: opts });
-      }
+    // Find availability and then **filter by price**
+    const opts = findAvailabilityInMonth(year, month, nights, 50);
+    const pricedOpts = await filterOptionsWithPrice(opts, nights, 24);
 
-      if (results.length) {
-        session.prefs = session.prefs || {};
-        session.prefs.lastRequestedNights = nights;
+    if (pricedOpts.length) {
+      (session as any).prefs = (session as any).prefs || {};
+      (session as any).prefs.lastRequestedNights = nights;
+      (session as any).pending = { kind: 'awaiting-date-pick', nights };
 
-        const bullets: string[] = [];
-        for (const r of results) {
-          const niceMonth = MONTHS[r.month - 1][0].toUpperCase() + MONTHS[r.month - 1].slice(1);
-          const subset = r.options.slice(0, 5);
-          const priced = await Promise.all(subset.map(async o => {
-            const q = await withTimeout(
-              quoteForStay({ from: o.from, nights: r.nights, dogs: 0 }),
-              2000,
-              () => ({ total: 0 } as any)
-            );
-            const priceTxt = q && typeof (q as any).total === 'number' && (q as any).total > 0 ? ` — ${fmtGBP((q as any).total)}` : '';
-            return `• ${o.from} (${r.nights} nights)${priceTxt}`;
-          }));
-          bullets.push(`**${niceMonth} ${r.year}**\n` + priced.join('\n'));
-        }
-
-        // set pending date pick for the nights we just listed
-        const chosen = results[0]!;
-        session.pending = { kind: 'awaiting-date-pick', nights: chosen.nights };
-
-        const answer = `Here are options I found:\n\n${bullets.join('\n\n')}\n\nTell me which date you prefer (e.g., 2026-04-30), or say "next" to see the following month.`;
-        pushMessage(session, 'assistant', answer);
-        return res.json({ answer });
-      } else {
-        session.pending = { kind: 'ask-nearby-months', year, month, nights };
-        const niceMonth = MONTHS[month - 1][0].toUpperCase() + MONTHS[month - 1].slice(1);
-        const answer = `I still can’t find a ${nights}-night opening in ${niceMonth} ${year}. Say "next" to check the following month, or tell me a different month or length of stay.`;
-        pushMessage(session, 'assistant', answer);
-        return res.json({ answer });
-      }
+      const niceMonth = MONTHS[month - 1][0].toUpperCase() + MONTHS[month - 1].slice(1);
+      const lines = pricedOpts.slice(0, 12).map(p => `• ${p.from} (${nights} nights) — ${fmtGBP(p.total)}`);
+      const answer = `Here are options in ${niceMonth} ${year}:\n\n${lines.join('\n')}\n\nTell me which date you prefer (e.g., 2026-08-14).`;
+      pushMessage(session, 'assistant', answer);
+      return res.json({ answer });
+    } else {
+      (session as any).pending = { kind: 'ask-nearby-months', year, month, nights };
+      const niceMonth = MONTHS[month - 1][0].toUpperCase() + MONTHS[month - 1].slice(1);
+      const answer = `I couldn’t find any priceable ${nights}-night options in ${niceMonth} ${year}. Say "next" to check the following month, or tell me a different month/length.`;
+      pushMessage(session, 'assistant', answer);
+      return res.json({ answer });
     }
   }
 
@@ -360,36 +315,27 @@ app.post('/api/chat', async (req, res) => {
   if (flex) {
     const { year, month, nights } = flex;
 
-    session.prefs = session.prefs || {};
-    session.prefs.lastRequestedNights = nights;
+    (session as any).prefs = (session as any).prefs || {};
+    (session as any).prefs.lastRequestedNights = nights;
 
-    const options = findAvailabilityInMonth(year, month, nights, 20);
-    if (options.length) {
-      const first = options.slice(0, 8);
-      const priced = await Promise.all(first.map(async o => {
-        const q = await withTimeout(
-          quoteForStay({ from: o.from, nights, dogs: 0 }),
-          2000,
-          () => ({ total: 0 } as any)
-        );
-        const priceTxt = q && typeof (q as any).total === 'number' && (q as any).total > 0 ? ` — ${fmtGBP((q as any).total)}` : '';
-        return `• ${o.from} (${nights} nights)${priceTxt}`;
-      }));
+    // Find availability then **filter by price**
+    const opts = findAvailabilityInMonth(year, month, nights, 100);
+    const pricedOpts = await filterOptionsWithPrice(opts, nights, 24);
+
+    if (pricedOpts.length) {
+      (session as any).pending = { kind: 'awaiting-date-pick', nights };
       const niceMonth = MONTHS[month-1][0].toUpperCase()+MONTHS[month-1].slice(1);
-
-      // set pending date pick for the nights we just listed
-      session.pending = { kind: 'awaiting-date-pick', nights };
-
+      const lines = pricedOpts.slice(0, 12).map(p => `• ${p.from} (${nights} nights) — ${fmtGBP(p.total)}`);
       const answer =
-        `Here are the available start dates in ${niceMonth} ${year} for ${nights} night(s):\n` +
-        priced.join('\n') +
-        `\n\nTell me which one you’d like (e.g., 2026-04-30) and I’ll price it and give you booking steps.`;
+        `Here are the available start dates in ${niceMonth} ${year} (priced):\n` +
+        lines.join('\n') +
+        `\n\nTell me which one you’d like (e.g., 2026-08-14).`;
       pushMessage(session, 'assistant', answer);
       return res.json({ answer });
     } else {
+      (session as any).pending = { kind: 'ask-nearby-months', year, month, nights };
       const niceMonth = MONTHS[month - 1][0].toUpperCase() + MONTHS[month - 1].slice(1);
-      session.pending = { kind: 'ask-nearby-months', year, month, nights };
-      const answer = `I couldn’t find a ${nights}-night opening in ${niceMonth} ${year}. Would you like me to look at nearby months or try a different length of stay?`;
+      const answer = `I couldn’t find any priceable ${nights}-night options in ${niceMonth} ${year}. Would you like me to look at nearby months or try a different length of stay?`;
       pushMessage(session, 'assistant', answer);
       return res.json({ answer });
     }
@@ -398,37 +344,31 @@ app.post('/api/chat', async (req, res) => {
   // 5) Booking flow for specific dates OR date-only replies
   {
     const dateOnly = extractIsoDate(message);
-
-    // Respect explicit “for N nights” over anything else
     let requestedNights =
       extractExplicitNightsStrict(message) ??
-      session.prefs?.lastRequestedNights;
-
+      (session as any).prefs?.lastRequestedNights ??
+      undefined;
     let requestedFrom = dateOnly || '';
 
-    // If we don't have a date yet and it looks like booking intent, ask LLM
     const bookingIntent = isBookingLikeHeuristic(message) || !!dateOnly;
     if (bookingIntent && !requestedFrom && process.env.OPENAI_API_KEY) {
       try {
         const intent = await interpretMessageWithLLM(message);
-        if (intent?.kind === 'dates') {
-          requestedFrom = intent.from || requestedFrom;
-          if (requestedNights == null && typeof intent.nights === 'number') {
-            requestedNights = intent.nights;
+        if ((intent as any)?.kind === 'dates') {
+          requestedFrom = (intent as any).from || requestedFrom;
+          if (requestedNights == null && typeof (intent as any).nights === 'number') {
+            requestedNights = (intent as any).nights;
           }
         }
       } catch (e) {
         console.warn('[chat] LLM extract failed — continuing with heuristics:', (e as any)?.message || e);
       }
     }
-
-    // Final defaults only if still missing:
     if (!requestedNights) requestedNights = 7;
 
     if (requestedFrom) {
-      // remember preference for future turns
-      session.prefs = session.prefs || {};
-      session.prefs.lastRequestedNights = requestedNights;
+      (session as any).prefs = (session as any).prefs || {};
+      (session as any).prefs.lastRequestedNights = requestedNights;
 
       const available = isRangeAvailable(requestedFrom, requestedNights);
       if (available) {
@@ -437,21 +377,15 @@ app.post('/api/chat', async (req, res) => {
         pushMessage(session, 'assistant', answer);
         return res.json({ answer });
       } else {
-        const alts = suggestAlternatives(requestedFrom, requestedNights, 6).slice(0, 5);
-        const priced = await Promise.all(alts.map(async a => {
-          const q = await withTimeout(
-            quoteForStay({ from: a.from, nights: requestedNights, dogs: 0 }),
-            2000,
-            () => ({ total: 0 } as any)
-          );
-          const priceTxt = q && typeof (q as any).total === 'number' && (q as any).total > 0 ? ` — ${fmtGBP((q as any).total)}` : '';
-          return `${a.from}${priceTxt}`;
-        }));
+        // Suggest alternatives, but **only ones with a price**
+        const alts = suggestAlternatives(requestedFrom, requestedNights, 20);
+        const filtered = await filterOptionsWithPrice(alts, requestedNights, 12);
+        const priced = filtered.map(a => `${a.from} — ${fmtGBP(a.total)}`);
 
         // keep nights sticky if they pick an alternative next
-        session.pending = { kind: 'awaiting-date-pick', nights: requestedNights };
+        (session as any).pending = { kind: 'awaiting-date-pick', nights: requestedNights };
 
-        const answer = `❌ Sorry, those dates look unavailable.${priced.length ? ` Closest alternatives: ${priced.join(', ')}.` : ''}`;
+        const answer = `❌ Sorry, those dates look unavailable.${priced.length ? ` Closest priceable alternatives: ${priced.join(', ')}.` : ' I couldn’t find priceable alternatives right now.'}`;
         pushMessage(session, 'assistant', answer);
         return res.json({ answer });
       }
