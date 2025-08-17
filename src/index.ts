@@ -1,10 +1,13 @@
 // src/index.ts
 //
-// Main chatbot server for Hansel Cottage.
-// - ICS (broad scan) + Bookalet (pricing/valid starts)
-// - RAG for PDFs/site content
-// - Returns BOTH { answer } and { reply } for front-end compatibility
-// - Keeps PDF boot ingest logs and /api/chat alias
+// Hansel Cottage chatbot server (compat mode).
+// - ICS scan + Bookalet price validation
+// - RAG for PDFs/site
+// - Accepts {message}|{text}|{question}; optional conversationId (auto if missing)
+// - Returns {answer, reply, message, text, success, history} to satisfy older widgets
+// - /chat and /api/chat routes
+// - PDF boot ingest logs
+// - Node16 module resolution friendly (.js extensions)
 
 import express from 'express';
 import cors from 'cors';
@@ -38,7 +41,7 @@ const allowedList = (process.env.ALLOWED_ORIGIN || '*')
 const app = express();
 app.use(cors({
   origin(origin, cb) {
-    if (!origin) return cb(null, true); // allow curl / local files with null origin
+    if (!origin) return cb(null, true); // allow curl / local files opened from disk
     if (allowedList.includes('*') || allowedList.includes(origin)) return cb(null, true);
     return cb(new Error('Not allowed by CORS'));
   },
@@ -50,14 +53,14 @@ app.options('*', cors()); // preflight
 
 app.use(bodyParser.json());
 
-// Serve static files (so local PDFs under /public are fetchable)
+// Serve static (for /public PDFs)
 const publicDir = path.resolve(process.cwd(), 'public');
 app.use(express.static(publicDir));
 
+/* ---------- Tiny session store ---------- */
 type ChatMessage = { role: 'user' | 'assistant'; content: string };
-const conversations = new Map<string, ChatMessage[]>(); // conversationId -> history
+const conversations = new Map<string, ChatMessage[]>();
 
-// ---- conversation helpers ----
 function getHistory(id: string) {
   if (!conversations.has(id)) conversations.set(id, []);
   return conversations.get(id)!;
@@ -65,56 +68,93 @@ function getHistory(id: string) {
 function addToHistory(id: string, msg: ChatMessage) {
   const hist = getHistory(id);
   hist.push(msg);
-  if (hist.length > 40) hist.splice(0, hist.length - 40); // keep last 20 exchanges
+  if (hist.length > 40) hist.splice(0, hist.length - 40);
+}
+function makeSessionId(req: express.Request): string {
+  // Use provided header/id if any; else synthesize a short session token
+  const fromHeader = (req.headers['x-session-id'] as string) || '';
+  if (fromHeader) return String(fromHeader);
+  const ua = (req.headers['user-agent'] || '').toString();
+  const ip = (req.headers['x-forwarded-for'] || req.socket.remoteAddress || '').toString();
+  const seed = `${Date.now()}-${Math.random().toString(36).slice(2, 8)}-${ua.slice(0,12)}-${ip.slice(0,12)}`;
+  return Buffer.from(seed).toString('base64').replace(/[^a-zA-Z0-9]/g, '').slice(0, 24);
 }
 
-/* ---------- Shared chat handler (returns {answer, reply, history}) ---------- */
-async function handleChat(message: string, conversationId: string) {
+/* ---------- Utilities ---------- */
+function okPayload(answer: string, history: ChatMessage[]) {
+  // Return many aliases so any widget picks one it expects
+  return {
+    success: true,
+    answer,
+    reply: answer,
+    message: answer,
+    text: answer,
+    history
+  };
+}
+function errPayload(answer: string, history: ChatMessage[]) {
+  return {
+    success: false,
+    answer,
+    reply: answer,
+    message: answer,
+    text: answer,
+    history
+  };
+}
+
+/* ---------- Core chat handler ---------- */
+async function handleChat(req: express.Request, res: express.Response) {
+  // Accept multiple shapes
+  const body: any = req.body || {};
+  const message: string = String(body.message ?? body.text ?? body.question ?? '').trim();
+  let conversationId: string = String(body.conversationId ?? '').trim();
+  if (!message) return res.status(400).json(errPayload('Message is required', []));
+
+  if (!conversationId) {
+    conversationId = makeSessionId(req);
+  }
+
   const history = getHistory(conversationId);
   addToHistory(conversationId, { role: 'user', content: message });
 
   try {
-    // Step 1. Interpret intent
     const intent = await interpretMessageWithLLM(message);
 
-    // Step 2. Handle availability & pricing queries
+    // ---- Specific date flow ----
     if (intent.kind === 'dates') {
       await refreshIcs();
       const { from, nights } = intent;
 
       if (!isRangeAvailable(from, nights)) {
-        const alts = suggestAlternatives(from, nights, 12);
-        if (alts.length === 0) {
-          const reply = '❌ Sorry, those dates look unavailable.';
-          addToHistory(conversationId, { role: 'assistant', content: reply });
-          return { answer: reply, reply, history };
-        }
-        // Filter alternatives by Bookalet price > 0
+        // Suggest alternatives that are actually priceable
+        const alts = suggestAlternatives(from, nights, 16);
         const priced: { from: string; price: number }[] = [];
-        for (const a of alts.slice(0, 12)) {
+        for (const a of alts) {
           try {
             const q = await quoteForStay({ from: a.from, nights: a.nights });
             if (q.total > 0) priced.push({ from: a.from, price: q.total });
           } catch { /* ignore */ }
         }
-        const formatted = priced.slice(0, 6).map(v => `• ${v.from} — £${v.price.toFixed(2)}`).join('\n');
-        const reply = `❌ Sorry, those dates look unavailable.` + (formatted ? ` Closest priceable alternatives:\n${formatted}` : '');
-        addToHistory(conversationId, { role: 'assistant', content: reply });
-        return { answer: reply, reply, history };
+        const lines = priced.slice(0, 6).map(v => `• ${v.from} — £${v.price.toFixed(2)}`).join('\n');
+        const answer = `❌ Sorry, those dates look unavailable.${lines ? ` Closest priceable alternatives:\n${lines}` : ''}`;
+        addToHistory(conversationId, { role: 'assistant', content: answer });
+        return res.json(okPayload(answer, history));
       }
 
-      const quote = await quoteForStay({ from, nights });
-      const reply = `✅ Available from ${from} for ${nights} night(s). Estimated total: GBP ${quote.total.toFixed(2)}. Would you like the booking link?`;
-      addToHistory(conversationId, { role: 'assistant', content: reply });
-      return { answer: reply, reply, history };
+      const q = await quoteForStay({ from, nights });
+      const answer = `✅ Available from ${from} for ${nights} night(s). Estimated total: GBP ${q.total.toFixed(2)}. Would you like the booking link?`;
+      addToHistory(conversationId, { role: 'assistant', content: answer });
+      return res.json(okPayload(answer, history));
     }
 
+    // ---- Month flow ----
     if (intent.kind === 'month') {
       await refreshIcs();
       const { year, month, nights } = intent;
       const candidates = findAvailabilityInMonth(year, month, nights, 100);
 
-      // Check Bookalet pricing to filter only valid start dates (e.g., Fridays)
+      // Only keep starts that price > 0 (e.g., Bookalet-allowed changeover)
       const valid: { from: string; price: number }[] = [];
       for (const c of candidates) {
         try {
@@ -123,55 +163,44 @@ async function handleChat(message: string, conversationId: string) {
         } catch { /* skip */ }
       }
 
-      if (valid.length === 0) {
-        const reply = `❌ I couldn’t find a ${nights}-night opening in ${year}-${String(month).padStart(2,'0')}.`;
-        addToHistory(conversationId, { role: 'assistant', content: reply });
-        return { answer: reply, reply, history };
+      if (!valid.length) {
+        const answer = `❌ I couldn’t find a ${nights}-night opening in ${year}-${String(month).padStart(2, '0')}.`;
+        addToHistory(conversationId, { role: 'assistant', content: answer });
+        return res.json(okPayload(answer, history));
       }
 
       if (valid.length > 6) {
-        const reply = `We have lots of dates available then. Can you narrow it down and be more specific (e.g., “Fridays only”, “mid-month”, or a specific date like ${year}-${String(month).padStart(2,'0')}-18)?`;
-        addToHistory(conversationId, { role: 'assistant', content: reply });
-        return { answer: reply, reply, history };
+        const answer = `We have lots of dates available then. Can you narrow it down and be more specific (e.g., “Fridays only”, “mid-month”, or a specific date like ${year}-${String(month).padStart(2, '0')}-18)?`;
+        addToHistory(conversationId, { role: 'assistant', content: answer });
+        return res.json(okPayload(answer, history));
       }
 
-      const formatted = valid
+      const lines = valid
         .slice(0, 6)
         .map(v => `• ${v.from} (${nights} nights) — £${v.price.toFixed(2)}`)
         .join('\n');
 
-      const reply = `Here are the available start dates in ${year}-${String(month).padStart(2,'0')} for ${nights} night(s):\n${formatted}\n\nTell me which one you’d like and I can give you the booking steps.`;
-      addToHistory(conversationId, { role: 'assistant', content: reply });
-      return { answer: reply, reply, history };
+      const answer = `Here are the available start dates in ${year}-${String(month).padStart(2, '0')} for ${nights} night(s):\n${lines}\n\nTell me which one you’d like and I can give you the booking steps.`;
+      addToHistory(conversationId, { role: 'assistant', content: answer });
+      return res.json(okPayload(answer, history));
     }
 
-    // Step 3. General Q&A → RAG
+    // ---- General questions → RAG ----
     const rag = await answerWithContext(message, history);
     addToHistory(conversationId, { role: 'assistant', content: rag.answer });
-    return { answer: rag.answer, reply: rag.answer, history };
+    return res.json(okPayload(rag.answer, history));
 
-  } catch (err: any) {
-    console.error('chat error', err);
-    const reply = '⚠️ Sorry, something went wrong. Please try again.';
-    addToHistory(conversationId, { role: 'assistant', content: reply });
-    return { answer: reply, reply, history };
+  } catch (e: any) {
+    console.error('chat error', e?.message || e);
+    const answer = '⚠️ Sorry, something went wrong. Please try again.';
+    addToHistory(conversationId, { role: 'assistant', content: answer });
+    return res.json(errPayload(answer, history));
   }
 }
 
-/* ---------- Routes (support both /chat and /api/chat) ---------- */
-app.post('/chat', async (req, res) => {
-  const { message, conversationId } = req.body as { message: string; conversationId: string };
-  if (!message || !conversationId) return res.status(400).json({ error: 'message and conversationId required' });
-  const result = await handleChat(message, conversationId);
-  res.json(result);
-});
-
-app.post('/api/chat', async (req, res) => {
-  const { message, conversationId } = req.body as { message: string; conversationId: string };
-  if (!message || !conversationId) return res.status(400).json({ error: 'message and conversationId required' });
-  const result = await handleChat(message, conversationId);
-  res.json(result);
-});
+/* ---------- Routes (both /chat and /api/chat) ---------- */
+app.post('/chat', handleChat);
+app.post('/api/chat', handleChat);
 
 /* ---------- health ---------- */
 app.get('/health', (_req, res) => res.json({ ok: true, time: new Date().toISOString() }));
@@ -181,14 +210,10 @@ app.get('/', (_req, res) => res.send('Hansel Cottage Chatbot running.'));
 app.listen(PORT, async () => {
   console.log(`Server listening on ${PORT}`);
 
-  // Prime RAG index (placeholder)
-  try {
-    await refreshContentIndex();
-  } catch (e: any) {
+  try { await refreshContentIndex(); } catch (e: any) {
     console.warn('[rag] init error', e?.message || e);
   }
 
-  // PDF auto-ingest on boot (supports full URLs or files under /public)
   const raw = (process.env.PDF_URLS || '').split(',').map(s => s.trim()).filter(Boolean);
   for (let entry of raw) {
     try {
@@ -197,7 +222,6 @@ app.listen(PORT, async () => {
         console.log('[pdf boot] HTTP:', entry);
         text = await extractPdfTextFromUrl(entry);
       } else {
-        // normalise relative path to /public
         let rel = entry.replace(/^\/+/, '');
         if (/^public\//i.test(rel)) rel = rel.slice(7);
         const localPath = path.resolve(publicDir, rel);
@@ -211,10 +235,7 @@ app.listen(PORT, async () => {
     }
   }
 
-  // Keep ICS fresh
-  try {
-    await refreshIcs();
-  } catch (e: any) {
+  try { await refreshIcs(); } catch (e: any) {
     console.warn('[ics] init error', e?.message || e);
   }
 });
