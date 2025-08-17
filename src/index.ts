@@ -1,17 +1,12 @@
 // src/index.ts
-//
-// Main chatbot server for Hansel Cottage.
-// Availability via ICS (broad scan) + Bookalet API for pricing.
-// RAG for website/PDF content.
-// Multi-turn context-aware conversation.
 
 import express from 'express';
 import cors from 'cors';
 import bodyParser from 'body-parser';
-import { refreshIcs, findAvailabilityInMonth, isRangeAvailable, suggestAlternatives } from './ics';
-import { quoteForStay } from './pricing';
-import { interpretMessageWithLLM } from './nlp';
-import { answerWithContext } from './rag';
+import { refreshIcs, findAvailabilityInMonth, isRangeAvailable, suggestAlternatives } from './ics.js';
+import { quoteForStay } from './pricing.js';
+import { interpretMessageWithLLM } from './nlp.js';
+import { answerWithContext } from './rag.js';
 
 const PORT = process.env.PORT || 3000;
 const ALLOWED_ORIGIN = process.env.ALLOWED_ORIGIN || '*';
@@ -57,7 +52,7 @@ app.post('/chat', async (req, res) => {
           addToHistory(conversationId, { role: 'assistant', content: reply });
           return res.json({ reply, history });
         }
-        const formatted = alts.map(a => `• ${a.from}`).join('\n');
+        const formatted = alts.map((a: { from: string }) => `• ${a.from}`).join('\n');
         const reply = `❌ Sorry, those dates look unavailable. Closest alternatives:\n${formatted}`;
         addToHistory(conversationId, { role: 'assistant', content: reply });
         return res.json({ reply, history });
@@ -95,7 +90,10 @@ app.post('/chat', async (req, res) => {
         return res.json({ reply, history });
       }
 
-      const formatted = valid.map(v => `• ${v.from} (${nights} nights) — £${v.price.toFixed(2)}`).join('\n');
+      const formatted = valid.map((v: { from: string; price: number }) =>
+        `• ${v.from} (${nights} nights) — £${v.price.toFixed(2)}`
+      ).join('\n');
+
       const reply = `Here are the available start dates in ${year}-${String(month).padStart(2,'0')} for ${nights} night(s):\n${formatted}\n\nTell me which one you’d like and I can price it in full and give you booking steps.`;
       addToHistory(conversationId, { role: 'assistant', content: reply });
       return res.json({ reply, history });
