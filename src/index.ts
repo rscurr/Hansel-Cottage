@@ -338,7 +338,7 @@ const WEEKDAY_NAMES: Record<string, number> = {
   monday: 1, mon: 1,
   tuesday: 2, tue: 2, tues: 2,
   wednesday: 3, wed: 3,
-  thursday: 4, thu: 4, thurs: 4, thursday: 4,
+  thursday: 4, thu: 4, thurs: 4,
   friday: 5, fri: 5,
   saturday: 6, sat: 6,
 };
