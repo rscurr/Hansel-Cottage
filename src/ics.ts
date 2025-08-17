@@ -1,124 +1,139 @@
 // src/ics.ts
-import ical from 'node-ical';
-import { addDays, isBefore, isAfter, parseISO, startOfMonth, endOfMonth } from 'date-fns';
+//
+// Hybrid model support: fast availability scanning from ICS.
+// Set ICS_URL in your environment to your Bookalet calendar .ics feed.
+// This parser is intentionally simple and optimized for all-day bookings.
 
-type Booking = { start: string; end: string; summary?: string };
+import { addDays, eachDayOfInterval, endOfMonth, formatISO, isBefore, isEqual, isWithinInterval, parseISO, startOfMonth } from 'date-fns';
 
-let bookings: Booking[] = [];
-let lastRefresh: string | null = null;
+type Booking = { start: string; end: string }; // [start, end) ISO dates YYYY-MM-DD
+let BOOKINGS: Booking[] = [];
+let LAST_REFRESH = 0;
+const REFRESH_MS = 15 * 60 * 1000; // 15 minutes
 
-const ICS_URL = process.env.ICS_URL || ''; // e.g., "https://example.com/calendar.ics"
-
-export function getIcsStats() {
-  return { count: bookings.length, lastRefresh, hasUrl: !!ICS_URL };
+function toIsoDate(s: string): string {
+  // Accept YYYYMMDD or YYYY-MM-DD; return YYYY-MM-DD
+  if (/^\d{8}$/.test(s)) {
+    return `${s.slice(0,4)}-${s.slice(4,6)}-${s.slice(6,8)}`;
+  }
+  if (/^\d{4}-\d{2}-\d{2}$/.test(s)) return s;
+  // last resort: Date parse
+  const d = new Date(s);
+  return formatISO(d, { representation: 'date' });
 }
 
-export async function refreshIcs(force = false) {
-  if (!ICS_URL) {
-    console.warn('[ics] No ICS_URL set; skipping refresh.');
+// Very small .ics parser for all-day DTSTART/DTEND lines.
+// We assume bookings are VEVENT with DTSTART/DTEND and no overlaps within a single event.
+function parseIcs(text: string): Booking[] {
+  const lines = text.split(/\r?\n/);
+  let cur: Record<string,string> = {};
+  const events: Record<string,string>[] = [];
+
+  const flush = () => {
+    if (Object.keys(cur).length) {
+      events.push(cur);
+      cur = {};
+    }
+  };
+
+  for (const raw of lines) {
+    const line = raw.trim();
+    if (line === 'BEGIN:VEVENT') { cur = {}; continue; }
+    if (line === 'END:VEVENT') { flush(); continue; }
+    if (!line || line.startsWith('BEGIN:') || line.startsWith('END:')) continue;
+
+    const idx = line.indexOf(':');
+    if (idx === -1) continue;
+    const keyPart = line.slice(0, idx); // e.g. "DTSTART;VALUE=DATE" or "DTEND"
+    const val = line.slice(idx + 1);
+
+    const key = keyPart.split(';')[0].toUpperCase(); // "DTSTART" / "DTEND"
+    if (key === 'DTSTART' || key === 'DTEND') {
+      // VALUE=DATE case like 20250814 or date-time like 20250814T120000Z
+      const m = val.match(/^(\d{8})(T\d{6}Z)?$/);
+      if (m) {
+        cur[key] = toIsoDate(m[1]);
+      } else {
+        // fallback for other formats
+        cur[key] = toIsoDate(val);
+      }
+    }
+  }
+
+  // Map VEVENTs to [start, end) bookings
+  const bookings: Booking[] = [];
+  for (const e of events) {
+    if (!e.DTSTART || !e.DTEND) continue;
+    // ICS DTEND is exclusive; we keep it exclusive but store ISO-date strings
+    bookings.push({ start: e.DTSTART, end: e.DTEND });
+  }
+  // Normalize & sort
+  bookings.sort((a, b) => a.start.localeCompare(b.start));
+  return bookings;
+}
+
+export async function refreshIcs(force = false): Promise<void> {
+  const now = Date.now();
+  if (!force && now - LAST_REFRESH < REFRESH_MS) return;
+  const url = process.env.ICS_URL;
+  if (!url) {
+    BOOKINGS = [];
+    LAST_REFRESH = now;
     return;
   }
-  try {
-    let data: Record<string, any> | null = null;
-
-    // Preferred: built-in fetcher (when available)
-    try {
-      // @ts-ignore - .async may not be typed
-      if (ical?.async?.fromURL) {
-        // @ts-ignore
-        data = await ical.async.fromURL(ICS_URL);
-      }
-    } catch (e) {
-      console.warn('[ics] async.fromURL failed, will fetch manually:', (e as any)?.message || e);
-    }
-
-    // Fallback: fetch text, then parse
-    if (!data) {
-      const res = await fetch(ICS_URL);
-      if (!res.ok) throw new Error(`ICS fetch failed: ${res.status} ${res.statusText}`);
-      const text = await res.text();
-      // node-ical exposes parseICS synchronously on default export
-      // @ts-ignore
-      data = ical.parseICS(text);
-    }
-
-    const out: Booking[] = [];
-    for (const k of Object.keys(data)) {
-      const ev = (data as any)[k];
-      if (!ev || ev.type !== 'VEVENT') continue;
-      if (!ev.start || !ev.end) continue;
-      const startISO = toIso(ev.start);
-      const endISO = toIso(ev.end);
-      out.push({ start: startISO, end: endISO, summary: ev.summary });
-    }
-    out.sort((a, b) => a.start.localeCompare(b.start));
-    bookings = out;
-    lastRefresh = new Date().toISOString();
-    console.log('[ics] refreshed', bookings.length, 'events');
-  } catch (e) {
-    console.error('[ics] refresh failed:', e);
-    if (!force) throw e;
-  }
+  const res = await fetch(url);
+  if (!res.ok) throw new Error(`ICS fetch ${res.status}`);
+  const text = await res.text();
+  BOOKINGS = parseIcs(text);
+  LAST_REFRESH = now;
 }
 
-function toIso(d: Date | string): string {
-  const dt = d instanceof Date ? d : new Date(d);
-  return dt.toISOString().slice(0, 10);
+export function getIcsStats() {
+  return {
+    bookings: BOOKINGS.length,
+    lastRefresh: LAST_REFRESH ? new Date(LAST_REFRESH).toISOString() : null
+  };
 }
 
-export function isRangeAvailable(fromISO: string, nights: number): boolean {
-  const start = parseISO(fromISO);
-  const end = addDays(start, nights);
+function overlaps(aStart: string, aEnd: string, bStart: string, bEnd: string): boolean {
+  // intervals [aStart, aEnd) and [bStart, bEnd) overlap if aStart < bEnd && bStart < aEnd
+  return aStart < bEnd && bStart < aEnd;
+}
 
-  for (const b of bookings) {
-    const bStart = parseISO(b.start);
-    const bEnd = parseISO(b.end);
-    // Overlap if start < bEnd AND end > bStart
-    const overlaps = isBefore(start, bEnd) && isAfter(end, bStart);
-    if (overlaps) return false;
+export function isRangeAvailable(fromIso: string, nights: number): boolean {
+  if (nights <= 0) return false;
+  const start = fromIso;
+  const end = formatISO(addDays(parseISO(fromIso), nights), { representation: 'date' });
+  for (const b of BOOKINGS) {
+    if (overlaps(start, end, b.start, b.end)) return false;
   }
   return true;
 }
 
-export function suggestAlternatives(fromISO: string, nights: number, max = 10) {
-  const suggestions: Array<{ from: string; nights: number }> = [];
-  const start = parseISO(fromISO);
-
-  // Try the next 60 days for an open stretch
-  for (let i = 1; i <= 60 && suggestions.length < max; i++) {
-    const candStart = addDays(start, i);
-    const candISO = toIso(candStart as any);
-    if (isRangeAvailable(candISO, nights)) {
-      suggestions.push({ from: candISO, nights });
-    }
+export function suggestAlternatives(fromIso: string, nights: number, max = 10): Array<{ from: string; nights: number }> {
+  const startDate = parseISO(fromIso);
+  const forward: Array<{ from: string; nights: number }> = [];
+  // scan up to ~120 days ahead
+  for (let i = 1; i <= 120 && forward.length < max; i++) {
+    const d = addDays(startDate, i);
+    const iso = formatISO(d, { representation: 'date' });
+    if (isRangeAvailable(iso, nights)) forward.push({ from: iso, nights });
   }
-  return suggestions;
+  return forward;
 }
 
-/**
- * Find all available start dates between rangeStartISO and rangeEndISO (inclusive) that fit `nights`.
- * Scans day-by-day and returns up to `max` options.
- */
-export function findAvailabilityInRange(rangeStartISO: string, rangeEndISO: string, nights: number, max = 20) {
-  const out: Array<{ from: string; nights: number }> = [];
-  let d = parseISO(rangeStartISO);
-  const last = parseISO(rangeEndISO);
-  // We can start no later than (last - nights)
-  while (isBefore(d, addDays(last, 1)) && out.length < max) {
-    const iso = toIso(d);
-    if (isRangeAvailable(iso, nights)) out.push({ from: iso, nights });
-    d = addDays(d, 1);
-  }
-  return out;
-}
-
-/**
- * Convenience: find availability within a given month (1-12) of a year for `nights`.
- */
-export function findAvailabilityInMonth(year: number, month1to12: number, nights: number, max = 20) {
+export function findAvailabilityInMonth(year: number, month1to12: number, nights: number, max = 100): Array<{ from: string; nights: number }> {
   const first = startOfMonth(new Date(Date.UTC(year, month1to12 - 1, 1)));
   const last = endOfMonth(first);
-  const startISO = toIso(first);
-  const endISO = toIso(last);
-  return findAvailabilityInRange(startISO, endISO, nights, max);
+  const days = eachDayOfInterval({ start: first, end: last });
+  const out: Array<{ from: string; nights: number }> = [];
+
+  for (const d of days) {
+    const iso = formatISO(d, { representation: 'date' });
+    if (isRangeAvailable(iso, nights)) {
+      out.push({ from: iso, nights });
+      if (out.length >= max) break;
+    }
+  }
+  return out;
 }
