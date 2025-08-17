@@ -3,7 +3,7 @@
 // Hansel Cottage chatbot server (compat mode).
 // - ICS scan + Bookalet price validation
 // - RAG for PDFs/site
-// - Flexible narrowing follow-ups (weekday/ordinal/ranges/around/next/previous)
+// - Flexible narrowing follow-ups (weekday/ordinal/ranges/around + next/previous month)
 // - Accepts {message}|{text}|{question}; optional conversationId (auto if missing)
 // - Returns {answer, reply, message, text, success, history}
 // - /chat and /api/chat routes
@@ -123,7 +123,6 @@ type NarrowFilter =
   | { kind: 'dayrange'; lo: number; hi: number }  // inclusive
   | { kind: 'weeknum'; n: 1|2|3|4|5 }             // week blocks (1:1-7, 2:8-14, 3:15-21, 4:22-28, 5:29-31)
   | { kind: 'nthWeekday'; n: 1|2|3|4|5; dow: number } // e.g., second Friday
-  | { kind: 'next' } | { kind: 'previous' }       // <<< INCLUDED to fix TS error
   | { kind: 'date'; date: string };
 
 function parseOrdinalWord(t: string): 1|2|3|4|5|null {
@@ -137,10 +136,6 @@ function parseOrdinalWord(t: string): 1|2|3|4|5|null {
 
 function parseNarrowing(msg: string): NarrowFilter | null {
   const t = msg.trim().toLowerCase();
-
-  // quick navigation
-  if (/^\s*next\s*$/i.test(t)) return { kind: 'next' };
-  if (/^\s*prev(ious)?\s*$/i.test(t)) return { kind: 'previous' };
 
   // ISO date?
   const dateMatch = t.match(/\b(\d{4}-\d{2}-\d{2})\b/);
@@ -259,10 +254,6 @@ function applyNarrowingFilter(dates: Array<{ from: string; price: number }>, f: 
         return (day >= lo && day <= hi) && (dow === f.dow);
       });
     }
-    case 'next':
-    case 'previous':
-      // handled upstream (month navigation)
-      return dates;
   }
 }
 
@@ -284,15 +275,15 @@ async function handleChat(req: express.Request, res: express.Response) {
   // ---- Handle narrowing follow-ups first (if we asked user to narrow down previously) ----
   let pending = pendingNarrowByConv.get(conversationId);
   if (pending) {
-    // month navigation: next/previous
-    const nf0 = parseNarrowing(message);
-    if (nf0?.kind === 'next' || nf0?.kind === 'previous') {
+    // Handle month navigation *without* using union kinds to avoid TS2367
+    const navNext = /^\s*next\s*$/i.test(message);
+    const navPrev = /^\s*prev(ious)?\s*$/i.test(message);
+    if (navNext || navPrev) {
       let { year, month } = pending;
-      if (nf0.kind === 'next') { month += 1; if (month > 12) { month = 1; year += 1; } }
-      else { month -= 1; if (month < 1) { month = 12; year -= 1; } }
+      if (navNext) { month += 1; if (month > 12) { month = 1; year += 1; } }
+      if (navPrev) { month -= 1; if (month < 1) { month = 12; year -= 1; } }
       pending = { ...pending, year, month };
       pendingNarrowByConv.set(conversationId, pending);
-      // fall through to run a fresh month listing (as if user asked month)
       const phantomIntent = { kind: 'month', year, month, nights: pending.nights } as const;
       return await runMonthFlow(phantomIntent, conversationId, history, res, /*keepPending*/ true);
     }
@@ -319,7 +310,8 @@ async function handleChat(req: express.Request, res: express.Response) {
       return res.json(okPayload(answer, history));
     }
 
-    // parse flexible narrowing
+    // parse flexible narrowing (non-navigation)
+    const nf0 = parseNarrowing(message);
     if (nf0) {
       const { year, month, nights } = pending;
       await refreshIcs();
@@ -332,32 +324,30 @@ async function handleChat(req: express.Request, res: express.Response) {
           if (q.total > 0) priced.push({ from: c.from, price: q.total });
         } catch { /* ignore */ }
       }
-      // month nav already handled; ignore here
-      if (nf0.kind !== 'next' && nf0.kind !== 'previous') {
-        let narrowed = applyNarrowingFilter(priced, nf0);
-        if (!narrowed.length) {
-          const example = priced.length ? priced[0].from : `${year}-${String(month).padStart(2,'0')}-18`;
-          const answer = `I couldn’t find priced options with that preference. Try a specific date (e.g., ${example}) or say “Fridays only”, “weekdays only”, “first half”, “second half”, “between 10th and 20th”, or “around the 18th”.`;
-          addToHistory(conversationId, { role: 'assistant', content: answer });
-          return res.json(okPayload(answer, history));
-        }
-        if (narrowed.length > 6) {
-          const answer = `There are still quite a few options. Could you pick a specific date in that range (e.g., ${narrowed[0].from})?`;
-          addToHistory(conversationId, { role: 'assistant', content: answer });
-          return res.json(okPayload(answer, history));
-        }
-        const lines = narrowed
-          .slice(0, 6)
-          .map(v => `• ${v.from} (${nights} nights) — £${v.price.toFixed(2)}`)
-          .join('\n');
-        const answer = `Here are the options I found:\n${lines}\n\nTell me which date you prefer.`;
+
+      let narrowed = applyNarrowingFilter(priced, nf0);
+      if (!narrowed.length) {
+        const example = priced.length ? priced[0].from : `${year}-${String(month).padStart(2,'0')}-18`;
+        const answer = `I couldn’t find priced options with that preference. Try a specific date (e.g., ${example}) or say “Fridays only”, “weekdays only”, “first half”, “second half”, “between 10th and 20th”, or “around the 18th”.`;
         addToHistory(conversationId, { role: 'assistant', content: answer });
         return res.json(okPayload(answer, history));
       }
+      if (narrowed.length > 6) {
+        const answer = `There are still quite a few options. Could you pick a specific date in that range (e.g., ${narrowed[0].from})?`;
+        addToHistory(conversationId, { role: 'assistant', content: answer });
+        return res.json(okPayload(answer, history));
+      }
+      const lines = narrowed
+        .slice(0, 6)
+        .map(v => `• ${v.from} (${nights} nights) — £${v.price.toFixed(2)}`)
+        .join('\n');
+      const answer = `Here are the options I found:\n${lines}\n\nTell me which date you prefer.`;
+      addToHistory(conversationId, { role: 'assistant', content: answer });
+      return res.json(okPayload(answer, history));
     }
 
     // unclear while narrowing
-    const answer = `I’m looking at ${pending.year}-${String(pending.month).padStart(2,'0')} for ${pending.nights} nights. You can say “Fridays only”, any weekday (e.g., “Monday”), “weekdays only”, “first/second half”, “first/second week”, “mid-month”, “between 10th and 20th”, “around the 18th”, “second Friday”, “next”, or give a date like ${pending.year}-${String(pending.month).padStart(2,'0')}-18.`;
+    const answer = `I’m looking at ${pending.year}-${String(pending.month).padStart(2,'0')} for ${pending.nights} nights. You can say “Fridays only”, any weekday (e.g., “Monday”), “weekdays only”, “first/second half”, “first/second week”, “mid-month”, “between 10th and 20th”, “around the 18th”, “second Friday”, “next/previous”, or give a date like ${pending.year}-${String(pending.month).padStart(2,'0')}-18.`;
     addToHistory(conversationId, { role: 'assistant', content: answer });
     return res.json(okPayload(answer, history));
   }
