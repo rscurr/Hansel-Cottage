@@ -1,12 +1,31 @@
 // src/index.ts
+//
+// Main chatbot server for Hansel Cottage.
+// Availability via ICS (broad scan) + Bookalet API for pricing.
+// RAG for website/PDF content.
+// Multi-turn context-aware conversation.
+// Restores boot-time PDF ingest logging: “[pdf boot] …”.
 
 import express from 'express';
 import cors from 'cors';
 import bodyParser from 'body-parser';
-import { refreshIcs, findAvailabilityInMonth, isRangeAvailable, suggestAlternatives } from './ics.js';
+import path from 'node:path';
+
+import {
+  refreshIcs,
+  findAvailabilityInMonth,
+  isRangeAvailable,
+  suggestAlternatives
+} from './ics.js';
+
 import { quoteForStay } from './pricing.js';
 import { interpretMessageWithLLM } from './nlp.js';
-import { answerWithContext } from './rag.js';
+import {
+  answerWithContext,
+  refreshContentIndex,
+  addExternalDocumentToIndex
+} from './rag.js';
+import { extractPdfTextFromUrl, extractPdfTextFromFile } from './pdf.js';
 
 const PORT = process.env.PORT || 3000;
 const ALLOWED_ORIGIN = process.env.ALLOWED_ORIGIN || '*';
@@ -14,6 +33,10 @@ const ALLOWED_ORIGIN = process.env.ALLOWED_ORIGIN || '*';
 const app = express();
 app.use(cors({ origin: ALLOWED_ORIGIN }));
 app.use(bodyParser.json());
+
+// Serve static files (so local PDFs under /public are fetchable)
+const publicDir = path.resolve(process.cwd(), 'public');
+app.use(express.static(publicDir));
 
 type ChatMessage = { role: 'user' | 'assistant'; content: string };
 const conversations = new Map<string, ChatMessage[]>(); // conversationId -> history
@@ -113,8 +136,47 @@ app.post('/chat', async (req, res) => {
 });
 
 // ---- health check ----
+app.get('/health', (_req, res) => res.json({ ok: true, time: new Date().toISOString() }));
 app.get('/', (_req, res) => res.send('Hansel Cottage Chatbot running.'));
 
-app.listen(PORT, () => {
+// ---- boot tasks: refresh RAG + ingest PDFs (with logs) ----
+app.listen(PORT, async () => {
   console.log(`Server listening on ${PORT}`);
+
+  // Prime RAG index (no-op placeholder but keep for consistency)
+  try {
+    await refreshContentIndex();
+  } catch (e: any) {
+    console.warn('[rag] init error', e?.message || e);
+  }
+
+  // PDF auto-ingest on boot (supports full URLs or files under /public)
+  const raw = (process.env.PDF_URLS || '').split(',').map(s => s.trim()).filter(Boolean);
+  for (let entry of raw) {
+    try {
+      let text: string;
+      if (/^https?:\/\//i.test(entry)) {
+        console.log('[pdf boot] HTTP:', entry);
+        text = await extractPdfTextFromUrl(entry);
+      } else {
+        // normalise relative path to /public
+        let rel = entry.replace(/^\/+/, '');
+        if (/^public\//i.test(rel)) rel = rel.slice(7);
+        const localPath = path.resolve(publicDir, rel);
+        console.log('[pdf boot] LOCAL:', localPath);
+        text = await extractPdfTextFromFile(localPath);
+      }
+      await addExternalDocumentToIndex('PDF', entry, text);
+      console.log('[pdf boot] indexed:', entry);
+    } catch (e: any) {
+      console.error('[pdf boot] ingest failed:', entry, e?.message || e);
+    }
+  }
+
+  // Keep ICS fresh
+  try {
+    await refreshIcs();
+  } catch (e: any) {
+    console.warn('[ics] init error', e?.message || e);
+  }
 });
