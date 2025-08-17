@@ -6,13 +6,17 @@
 // - Conversation memory for narrowing follow-ups
 // - PDF and website RAG ingest on boot
 // - Dates shown as "Fri 10 May"
-// - No "top 6" cap: returns ALL valid starts
+// - Returns ALL priceable starts (no 6-cap)
+// - FLEX DATE INPUTS: rich natural date parsing including
+//   "Mon 31 Aug", "31 Aug", "Aug 31", "31/08/2026", "31-08", "2026/08/31", "08/31/2026",
+//   "the 31st", "end of Aug", "early/mid/late August", "end of month", "mid-month",
+//   "last Friday (of Aug 2026)", "2nd Friday of August", "third Monday of Sep 2026", etc.
 
 import express from 'express';
 import cors from 'cors';
 import bodyParser from 'body-parser';
 import path from 'node:path';
-import { parseISO, getDay, getDate, format } from 'date-fns';
+import { parseISO, getDay, getDate, format, getDaysInMonth } from 'date-fns';
 
 import {
   refreshIcs,
@@ -127,6 +131,224 @@ function formatDate(iso: string): string {
   return format(parseISO(iso), 'EEE d MMM'); // "Fri 10 May"
 }
 
+/* ---------- Flexible date parsing ---------- */
+const MONTH_MAP: Record<string, number> = {
+  jan: 1, january: 1,
+  feb: 2, february: 2,
+  mar: 3, march: 3,
+  apr: 4, april: 4,
+  may: 5,
+  jun: 6, june: 6,
+  jul: 7, july: 7,
+  aug: 8, august: 8,
+  sep: 9, sept: 9, september: 9,
+  oct: 10, october: 10,
+  nov: 11, november: 11,
+  dec: 12, december: 12,
+};
+function pad2(n: number) { return n < 10 ? `0${n}` : String(n); }
+function clampDay(year: number, month: number, day: number) {
+  const dim = getDaysInMonth(new Date(year, month - 1, 1));
+  return Math.max(1, Math.min(dim, day));
+}
+function buildISO(y: number, m: number, d: number) {
+  return `${y}-${pad2(m)}-${pad2(clampDay(y, m, d))}`;
+}
+
+/** Get the ISO date for the Nth weekday of a given month (n=1..5). Returns null if that nth doesn't exist. */
+function nthWeekdayISO(year: number, month: number, dow: number, n: 1|2|3|4|5): string | null {
+  // Find first occurrence of dow in the month
+  const dim = getDaysInMonth(new Date(year, month - 1, 1));
+  let firstDowDay = -1;
+  for (let d = 1; d <= 7; d++) {
+    const dt = new Date(year, month - 1, d);
+    if (dt.getDay() === dow) { firstDowDay = d; break; }
+  }
+  if (firstDowDay < 0) return null;
+  const day = firstDowDay + (n - 1) * 7;
+  if (day > dim) return null;
+  return buildISO(year, month, day);
+}
+
+/** Get the ISO date for the LAST weekday of a given month. Always returns a valid date. */
+function lastWeekdayISO(year: number, month: number, dow: number): string {
+  const dim = getDaysInMonth(new Date(year, month - 1, 1));
+  for (let d = dim; d >= 1; d--) {
+    const dt = new Date(year, month - 1, d);
+    if (dt.getDay() === dow) return buildISO(year, month, d);
+  }
+  // Fallback (shouldn't happen)
+  return buildISO(year, month, dim);
+}
+
+/**
+ * Parse many human-friendly date formats into ISO (YYYY-MM-DD).
+ * If year or month are missing, use fallbackYear/fallbackMonth (the month currently being discussed).
+ * Accepted variants include:
+ *  - "Mon 31 Aug" / "31 Aug" / "Aug 31" / "31 Aug 2026" / "August 31 2026" / "2026 Aug 31"
+ *  - "31/08/2026" / "31-08-2026" / "31.08.2026"
+ *  - "31/08" / "31-08" (uses fallback year)
+ *  - "2026/08/31" / "2026-08-31"
+ *  - "08/31/2026" (US format)
+ *  - "31" (uses fallback year/month)
+ *  - "the 31st" / "31st" (uses fallback year/month)
+ *  - "early August" / "mid August" / "late August" / "end of Aug"
+ *  - "early month" / "mid-month" / "late month" / "end of month"
+ *  - NEW: "last Friday of Aug(ust) [2026]" → exact ISO using month in phrase
+ *  - NEW: "2nd Friday of August [2026]" / "third Monday of Sep 2026" → exact ISO using month in phrase
+ *  - NEW: "last Friday" / "2nd Friday" (uses fallback month/year)
+ */
+function parseHumanDateInMonth(
+  text: string,
+  fallbackYear?: number,
+  fallbackMonth?: number
+): string | null {
+  const t = text.trim().toLowerCase().replace(/\s+/g, ' ');
+
+  // Quick helpers
+  const tryWithFallback = (day: number) => {
+    if (fallbackYear && fallbackMonth) return buildISO(fallbackYear, fallbackMonth, day);
+    return null;
+  };
+
+  // A) Vague month phrases with explicit month name (early/mid/late/end of <Month> [Year])
+  let m = t.match(/\b(early|mid|late|end(?:\s+of)?)\s+([a-z]{3,9})(?:\s+(\d{4}))?\b/);
+  if (m) {
+    const phase = m[1]; const monKey = m[2]; const y = m[3] ? Number(m[3]) : (fallbackYear ?? NaN);
+    const mo = MONTH_MAP[monKey];
+    if (mo && Number.isFinite(y)) {
+      let day = 15;
+      if (/^early/.test(phase)) day = 5;
+      else if (/^mid/.test(phase)) day = 15;
+      else if (/^late/.test(phase)) day = 25;
+      else if (/^end/.test(phase)) day = getDaysInMonth(new Date(y, mo - 1, 1));
+      return buildISO(y, mo, day);
+    }
+  }
+
+  // A2) Vague month phrases without explicit month
+  m = t.match(/\b(early|mid(?:-|\s)?month|late|end(?:\s+of)?\s+month|end(?:\s+of)?)\b/);
+  if (m && fallbackYear && fallbackMonth) {
+    const phrase = m[1];
+    let day = 15;
+    if (/^early/.test(phrase)) day = 5;
+    else if (/^mid/.test(phrase)) day = 15;
+    else if (/^late/.test(phrase)) day = 25;
+    else if (/^end/.test(phrase)) day = getDaysInMonth(new Date(fallbackYear, fallbackMonth - 1, 1));
+    return buildISO(fallbackYear, fallbackMonth, day);
+  }
+
+  // B) "last Friday of Aug(ust) [2026]" or "second Friday of August [2026]" etc.
+  m = t.match(/\b(last|first|second|third|fourth|fifth|1st|2nd|3rd|4th|5th)\s+(mon|monday|tue|tues|tuesday|wed|wednesday|thu|thurs|thursday|fri|friday|sat|saturday|sun|sunday)(?:\s+of\s+([a-z]{3,9})(?:\s+(\d{4}))?)?\b/);
+  if (m) {
+    const ordRaw = m[1];
+    const wdKey = m[2];
+    const monKey = m[3];
+    const yearOpt = m[4] ? Number(m[4]) : (fallbackYear ?? NaN);
+    const dowMap: Record<string, number> = {
+      mon:1,monday:1,tue:2,tues:2,tuesday:2,wed:3,wednesday:3,thu:4,thurs:4,thursday:4,fri:5,friday:5,sat:6,saturday:6,sun:0,sunday:0
+    };
+    const dow = dowMap[wdKey];
+    const mo = monKey ? MONTH_MAP[monKey] : (fallbackMonth ?? NaN);
+    const y = Number.isFinite(yearOpt) ? yearOpt : NaN;
+    if (Number.isFinite(dow) && Number.isFinite(mo) && Number.isFinite(y)) {
+      if (/^last$/i.test(ordRaw)) {
+        return lastWeekdayISO(y, mo, dow);
+      } else {
+        const ordMap: Record<string, 1|2|3|4|5> = { first:1, '1st':1, second:2, '2nd':2, third:3, '3rd':3, fourth:4, '4th':4, fifth:5, '5th':5 };
+        const n = ordMap[ordRaw as keyof typeof ordMap];
+        if (n) {
+          const iso = nthWeekdayISO(y, mo, dow, n);
+          // If nth doesn’t exist (e.g., 5th Friday in a 4-Friday month), fall back to LAST
+          return iso ?? lastWeekdayISO(y, mo, dow);
+        }
+      }
+    }
+  }
+
+  // C) Numeric formats
+  // C1) dd/mm/yyyy or dd-mm-yyyy or dd.mm.yyyy
+  m = t.match(/\b(\d{1,2})[\/\-.](\d{1,2})[\/\-.](\d{4})\b/);
+  if (m) {
+    const d = Number(m[1]), mo = Number(m[2]), y = Number(m[3]);
+    if (mo >= 1 && mo <= 12 && d >= 1 && d <= 31) return buildISO(y, mo, d);
+  }
+  // C2) yyyy/mm/dd or yyyy-mm-dd or yyyy.mm.dd
+  m = t.match(/\b(\d{4})[\/\-.](\d{1,2})[\/\-.](\d{1,2})\b/);
+  if (m) {
+    const y = Number(m[1]), mo = Number(m[2]), d = Number(m[3]);
+    if (mo >= 1 && mo <= 12 && d >= 1 && d <= 31) return buildISO(y, mo, d);
+  }
+  // C3) mm/dd/yyyy (US)
+  m = t.match(/\b(\d{1,2})[\/\-.](\d{1,2})[\/\-.](\d{4})\b/);
+  if (m) {
+    const mo = Number(m[1]), d = Number(m[2]), y = Number(m[3]);
+    if (mo >= 1 && mo <= 12 && d >= 1 && d <= 31) return buildISO(y, mo, d);
+  }
+  // C4) dd/mm or dd-mm or dd.mm (use fallback year)
+  m = t.match(/\b(\d{1,2})[\/\-.](\d{1,2})\b/);
+  if (m && fallbackYear) {
+    const d = Number(m[1]), mo = Number(m[2]);
+    if (mo >= 1 && mo <= 12 && d >= 1 && d <= 31) return buildISO(fallbackYear, mo, d);
+  }
+
+  // D) Text month formats
+  // D1) "31 aug 2026" (day month year)
+  m = t.match(/\b(\d{1,2})\s+([a-z]{3,9})(?:\s+(\d{4}))?\b/);
+  if (m) {
+    const d = Number(m[1]), monKey = m[2], y = m[3] ? Number(m[3]) : (fallbackYear ?? NaN);
+    const mo = MONTH_MAP[monKey];
+    if (mo && d >= 1 && d <= 31 && Number.isFinite(y)) return buildISO(y, mo, d);
+  }
+  // D2) "aug 31 2026" (month day year)
+  m = t.match(/\b([a-z]{3,9})\s+(\d{1,2})(?:\s+(\d{4}))?\b/);
+  if (m) {
+    const monKey = m[1], d = Number(m[2]), y = m[3] ? Number(m[3]) : (fallbackYear ?? NaN);
+    const mo = MONTH_MAP[monKey];
+    if (mo && d >= 1 && d <= 31 && Number.isFinite(y)) return buildISO(y, mo, d);
+  }
+  // D3) "2026 aug 31" (year month day)
+  m = t.match(/\b(\d{4})\s+([a-z]{3,9})\s+(\d{1,2})\b/);
+  if (m) {
+    const y = Number(m[1]), monKey = m[2], d = Number(m[3]);
+    const mo = MONTH_MAP[monKey];
+    if (mo && d >= 1 && d <= 31) return buildISO(y, mo, d);
+  }
+
+  // E) Ordinal day with/without "the": "the 31st" / "31st"
+  m = t.match(/\b(?:the\s+)?(\d{1,2})(?:st|nd|rd|th)\b/);
+  if (m) {
+    const d = Number(m[1]);
+    if (d >= 1 && d <= 31) return tryWithFallback(d);
+  }
+
+  // F) Optional weekday + day only, e.g., "mon 31" or just "31"
+  if (fallbackYear && fallbackMonth) {
+    m = t.match(/\b(?:mon|tue|tues|wed|thu|thurs|fri|sat|sun)?\s*(\d{1,2})\b/);
+    if (m) {
+      const d = Number(m[1]);
+      if (d >= 1 && d <= 31) return buildISO(fallbackYear, fallbackMonth, d);
+    }
+  }
+
+  // G) "last friday" / "2nd friday" without month name → resolve with fallbacks if present
+  m = t.match(/\b(last|first|second|third|fourth|fifth|1st|2nd|3rd|4th|5th)\s+(mon|monday|tue|tues|tuesday|wed|wednesday|thu|thurs|thursday|fri|friday|sat|saturday|sun|sunday)\b/);
+  if (m && fallbackYear && fallbackMonth) {
+    const ordRaw = m[1];
+    const wdKey = m[2];
+    const dowMap: Record<string, number> = {
+      mon:1,monday:1,tue:2,tues:2,tuesday:2,wed:3,wednesday:3,thu:4,thurs:4,thursday:4,fri:5,friday:5,sat:6,saturday:6,sun:0,sunday:0
+    };
+    const dow = dowMap[wdKey];
+    if (/^last$/i.test(ordRaw)) return lastWeekdayISO(fallbackYear, fallbackMonth, dow);
+    const ordMap: Record<string, 1|2|3|4|5> = { first:1, '1st':1, second:2, '2nd':2, third:3, '3rd':3, fourth:4, '4th':4, fifth:5, '5th':5 };
+    const n = ordMap[ordRaw as keyof typeof ordMap];
+    if (n) return nthWeekdayISO(fallbackYear, fallbackMonth, dow, n) ?? lastWeekdayISO(fallbackYear, fallbackMonth, dow);
+  }
+
+  return null;
+}
+
 /* ---------- Narrowing parsing ---------- */
 const WEEKDAY_NAMES: Record<string, number> = {
   sunday: 0,
@@ -161,6 +383,7 @@ type NarrowFilter =
   | { kind: 'dayrange'; lo: number; hi: number }
   | { kind: 'weeknum'; n: 1 | 2 | 3 | 4 | 5 }
   | { kind: 'nthWeekday'; n: 1 | 2 | 3 | 4 | 5; dow: number }
+  | { kind: 'lastWeekday'; dow: number }
   | { kind: 'date'; date: string };
 
 function parseOrdinalWord(t: string): 1 | 2 | 3 | 4 | 5 | null {
@@ -186,6 +409,24 @@ function parseNarrowing(msg: string): NarrowFilter | null {
   for (const name in WEEKDAY_NAMES) {
     if (new RegExp(`\\b${name}\\b`).test(t))
       return { kind: 'weekday', dow: WEEKDAY_NAMES[name] };
+  }
+
+  if (/\blast\s+(mon|monday|tue|tues|tuesday|wed|wednesday|thu|thurs|thursday|fri|friday|sat|saturday|sun|sunday)\b/.test(t)) {
+    const wdKey = (t.match(/\blast\s+(mon|monday|tue|tues|tuesday|wed|wednesday|thu|thurs|thursday|fri|friday|sat|saturday|sun|sunday)\b/) || [])[1]!;
+    const dowMap: Record<string, number> = { mon:1,monday:1,tue:2,tues:2,tuesday:2,wed:3,wednesday:3,thu:4,thurs:4,thursday:4,fri:5,friday:5,sat:6,saturday:6,sun:0,sunday:0 };
+    return { kind: 'lastWeekday', dow: dowMap[wdKey] };
+  }
+
+  if (
+    /\b(first|1st|second|2nd|third|3rd|fourth|4th|fifth|5th)\s+(mon|monday|tue|tues|tuesday|wed|wednesday|thu|thurs|thursday|fri|friday|sat|saturday|sun|sunday)\b/.test(
+      t
+    )
+  ) {
+    const m2 = t.match(/\b(first|1st|second|2nd|third|3rd|fourth|4th|fifth|5th)\s+(mon|monday|tue|tues|tuesday|wed|wednesday|thu|thurs|thursday|fri|friday|sat|saturday|sun|sunday)\b/)!;
+    const wdKey = m2[2];
+    const dowMap: Record<string, number> = { mon:1,monday:1,tue:2,tues:2,tuesday:2,wed:3,wednesday:3,thu:4,thurs:4,thursday:4,fri:5,friday:5,sat:6,saturday:6,sun:0,sunday:0 };
+    const ordMap: Record<string, 1|2|3|4|5> = { first:1, '1st':1, second:2, '2nd':2, third:3, '3rd':3, fourth:4, '4th':4, fifth:5, '5th':5 };
+    return { kind: 'nthWeekday', n: ordMap[m2[1] as keyof typeof ordMap], dow: dowMap[wdKey] };
   }
 
   if (
@@ -222,12 +463,6 @@ function parseNarrowing(msg: string): NarrowFilter | null {
 
   const ord = parseOrdinalWord(t);
   if (ord && /\bweek\b/.test(t)) return { kind: 'weeknum', n: ord };
-  if (ord) {
-    for (const name in WEEKDAY_NAMES) {
-      if (new RegExp(`\\b${name}\\b`).test(t))
-        return { kind: 'nthWeekday', n: ord as 1 | 2 | 3 | 4 | 5, dow: WEEKDAY_NAMES[name] };
-    }
-  }
 
   const justAround = t.match(/\baround(?:\s+the)?\s+(\d{1,2})(?:st|nd|rd|th)?\b/);
   if (justAround) {
@@ -303,6 +538,16 @@ function applyNarrowingFilter(
         return day >= lo && day <= hi && dow === f.dow;
       });
     }
+    case 'lastWeekday': {
+      // Pick the maximum date among those matching the weekday
+      const candidates = dates.filter((d) => getDay(parseISO(d.from)) === f.dow);
+      if (!candidates.length) return [];
+      const maxIso = candidates
+        .map((c) => c.from)
+        .sort((a, b) => (a < b ? -1 : a > b ? 1 : 0))
+        .slice(-1)[0];
+      return dates.filter((d) => d.from === maxIso);
+    }
   }
 }
 
@@ -323,7 +568,9 @@ async function handleChat(req: express.Request, res: express.Response) {
   if (pending) {
     const navNext = /^\s*next\s*$/i.test(message);
     const navPrev = /^\s*prev(ious)?\s*$/i.test(message);
-    const explicitDate = isoFromBody(body);
+    const explicitIso = isoFromBody(body);
+    // Parse "Mon 31 Aug", "2nd Friday of Aug", "end of month", etc. using pending month/year as context
+    const humanIso = parseHumanDateInMonth(message, pending.year, pending.month);
     const nf0 = parseNarrowing(message);
 
     if (navNext || navPrev) {
@@ -348,6 +595,7 @@ async function handleChat(req: express.Request, res: express.Response) {
       return await runMonthFlow(phantomIntent, conversationId, history, res, /*keepPending*/ true);
     }
 
+    const explicitDate = explicitIso || humanIso;
     if (explicitDate) {
       const nights = pending.nights;
       await refreshIcs();
