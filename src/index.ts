@@ -1,10 +1,10 @@
 // src/index.ts
 //
 // Main chatbot server for Hansel Cottage.
-// Availability via ICS (broad scan) + Bookalet API for pricing.
-// RAG for website/PDF content.
-// Multi-turn context-aware conversation.
-// Restores boot-time PDF ingest logging and adds /api/chat alias.
+// - ICS (broad scan) + Bookalet (pricing/valid starts)
+// - RAG for PDFs/site content
+// - Returns BOTH { answer } and { reply } for front-end compatibility
+// - Keeps PDF boot ingest logs and /api/chat alias
 
 import express from 'express';
 import cors from 'cors';
@@ -68,7 +68,7 @@ function addToHistory(id: string, msg: ChatMessage) {
   if (hist.length > 40) hist.splice(0, hist.length - 40); // keep last 20 exchanges
 }
 
-/* ---------- Shared chat handler ---------- */
+/* ---------- Shared chat handler (returns {answer, reply, history}) ---------- */
 async function handleChat(message: string, conversationId: string) {
   const history = getHistory(conversationId);
   addToHistory(conversationId, { role: 'user', content: message });
@@ -85,9 +85,9 @@ async function handleChat(message: string, conversationId: string) {
       if (!isRangeAvailable(from, nights)) {
         const alts = suggestAlternatives(from, nights, 12);
         if (alts.length === 0) {
-          const reply = `❌ Sorry, those dates look unavailable.`;
+          const reply = '❌ Sorry, those dates look unavailable.';
           addToHistory(conversationId, { role: 'assistant', content: reply });
-          return { reply, history };
+          return { answer: reply, reply, history };
         }
         // Filter alternatives by Bookalet price > 0
         const priced: { from: string; price: number }[] = [];
@@ -100,13 +100,13 @@ async function handleChat(message: string, conversationId: string) {
         const formatted = priced.slice(0, 6).map(v => `• ${v.from} — £${v.price.toFixed(2)}`).join('\n');
         const reply = `❌ Sorry, those dates look unavailable.` + (formatted ? ` Closest priceable alternatives:\n${formatted}` : '');
         addToHistory(conversationId, { role: 'assistant', content: reply });
-        return { reply, history };
+        return { answer: reply, reply, history };
       }
 
       const quote = await quoteForStay({ from, nights });
       const reply = `✅ Available from ${from} for ${nights} night(s). Estimated total: GBP ${quote.total.toFixed(2)}. Would you like the booking link?`;
       addToHistory(conversationId, { role: 'assistant', content: reply });
-      return { reply, history };
+      return { answer: reply, reply, history };
     }
 
     if (intent.kind === 'month') {
@@ -126,13 +126,13 @@ async function handleChat(message: string, conversationId: string) {
       if (valid.length === 0) {
         const reply = `❌ I couldn’t find a ${nights}-night opening in ${year}-${String(month).padStart(2,'0')}.`;
         addToHistory(conversationId, { role: 'assistant', content: reply });
-        return { reply, history };
+        return { answer: reply, reply, history };
       }
 
       if (valid.length > 6) {
         const reply = `We have lots of dates available then. Can you narrow it down and be more specific (e.g., “Fridays only”, “mid-month”, or a specific date like ${year}-${String(month).padStart(2,'0')}-18)?`;
         addToHistory(conversationId, { role: 'assistant', content: reply });
-        return { reply, history };
+        return { answer: reply, reply, history };
       }
 
       const formatted = valid
@@ -142,23 +142,23 @@ async function handleChat(message: string, conversationId: string) {
 
       const reply = `Here are the available start dates in ${year}-${String(month).padStart(2,'0')} for ${nights} night(s):\n${formatted}\n\nTell me which one you’d like and I can give you the booking steps.`;
       addToHistory(conversationId, { role: 'assistant', content: reply });
-      return { reply, history };
+      return { answer: reply, reply, history };
     }
 
-    // Step 3. Fallback to RAG for general Q&A
+    // Step 3. General Q&A → RAG
     const rag = await answerWithContext(message, history);
     addToHistory(conversationId, { role: 'assistant', content: rag.answer });
-    return { reply: rag.answer, history };
+    return { answer: rag.answer, reply: rag.answer, history };
 
   } catch (err: any) {
     console.error('chat error', err);
     const reply = '⚠️ Sorry, something went wrong. Please try again.';
     addToHistory(conversationId, { role: 'assistant', content: reply });
-    return { reply, history };
+    return { answer: reply, reply, history };
   }
 }
 
-/* ---------- Routes (both /chat and /api/chat) ---------- */
+/* ---------- Routes (support both /chat and /api/chat) ---------- */
 app.post('/chat', async (req, res) => {
   const { message, conversationId } = req.body as { message: string; conversationId: string };
   if (!message || !conversationId) return res.status(400).json({ error: 'message and conversationId required' });
@@ -166,7 +166,6 @@ app.post('/chat', async (req, res) => {
   res.json(result);
 });
 
-// Alias to support older widget/test pages
 app.post('/api/chat', async (req, res) => {
   const { message, conversationId } = req.body as { message: string; conversationId: string };
   if (!message || !conversationId) return res.status(400).json({ error: 'message and conversationId required' });
