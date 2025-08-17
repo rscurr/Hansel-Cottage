@@ -1,7 +1,8 @@
 // src/index.ts
 //
 // Hansel Cottage chatbot server (compat mode).
-// - ICS scan + Bookalet price validation (strict: Days === nights)
+// - ICS scan + Bookalet price validation (strict: Days === nights & total > 0)
+// - Auto changeover detection (dominant weekday) + optional env override
 // - RAG for PDFs/site
 // - Flexible narrowing follow-ups with escape to general Q&A
 // - Accepts {message}|{text}|{question}; optional conversationId
@@ -97,6 +98,7 @@ const WEEKDAY_NAMES: Record<string, number> = {
   sunday: 0, sun: 0, monday: 1, mon: 1, tuesday: 2, tue: 2, tues: 2,
   wednesday: 3, wed: 3, thursday: 4, thu: 4, thurs: 4, friday: 5, fri: 5, saturday: 6, sat: 6
 };
+const DOW_TO_NAME: Record<number, string> = { 0:'Sunday',1:'Monday',2:'Tuesday',3:'Wednesday',4:'Thursday',5:'Friday',6:'Saturday' };
 type NarrowFilter =
   | { kind: 'fridays' }
   | { kind: 'weekdays' }
@@ -180,6 +182,52 @@ function applyNarrowingFilter(dates: Array<{ from: string; price: number }>, f: 
   }
 }
 
+/* ---------- Changeover detection & override ---------- */
+
+// Optional env override: e.g. CHANGEOVER_BY_MONTH="7:fri,8:fri,12:mon"
+const CHANGEOVER_BY_MONTH = (() => {
+  const raw = (process.env.CHANGEOVER_BY_MONTH || '').trim();
+  if (!raw) return {} as Record<number, number>;
+  const map: Record<number, number> = {};
+  const parseDow = (s: string): number | null => {
+    const k = s.toLowerCase().slice(0,3);
+    if (k === 'sun') return 0;
+    if (k === 'mon') return 1;
+    if (k === 'tue') return 2;
+    if (k === 'wed') return 3;
+    if (k === 'thu') return 4;
+    if (k === 'fri') return 5;
+    if (k === 'sat') return 6;
+    return null;
+  };
+  for (const part of raw.split(',').map(s => s.trim()).filter(Boolean)) {
+    const [mStr, dowStr] = part.split(':').map(s => s.trim());
+    const m = Number(mStr);
+    const d = parseDow(dowStr || '');
+    if (m >= 1 && m <= 12 && d != null) map[m] = d;
+  }
+  return map;
+})();
+
+function dominantWeekday(dates: Array<{ from: string }>): number | null {
+  if (!dates.length) return null;
+  const counts = new Array(7).fill(0);
+  for (const d of dates) counts[getDay(parseISO(d.from))]++;
+
+  let best = 0, idx = 0;
+  for (let i = 0; i < 7; i++) {
+    if (counts[i] > best) { best = counts[i]; idx = i; }
+  }
+  const ratio = best / dates.length;
+  // Heuristic: at least 60% of starts on one weekday and at least 3 instances
+  if (best >= 3 && ratio >= 0.6) return idx;
+  return null;
+}
+
+function filterByDow(dates: Array<{ from: string; price: number }>, dow: number) {
+  return dates.filter(d => getDay(parseISO(d.from)) === dow);
+}
+
 /* ---------- Core chat handler ---------- */
 async function handleChat(req: express.Request, res: express.Response) {
   const body: any = req.body || {};
@@ -218,7 +266,7 @@ async function handleChat(req: express.Request, res: express.Response) {
         return res.json(okPayload(answer, history));
       }
       const q = await quoteForStay({ from: explicitDate, nights });
-      if (!q.matchedNights || q.total <= 0) {
+      if (q.total <= 0) {
         const answer = 'That date doesn’t appear to be a valid start day for that length. Want me to show valid (priced) starts?';
         addToHistory(conversationId, { role: 'assistant', content: answer });
         return res.json(okPayload(answer, history));
@@ -235,14 +283,24 @@ async function handleChat(req: express.Request, res: express.Response) {
       const candidates = findAvailabilityInMonth(year, month, nights, 200);
       const priced: { from: string; price: number }[] = [];
       for (const c of candidates) {
-        try {
-          const q = await quoteForStay({ from: c.from, nights: c.nights });
-          if (q.matchedNights && q.total > 0) priced.push({ from: c.from, price: q.total });
-        } catch {}
+        try { const q = await quoteForStay({ from: c.from, nights: c.nights }); if (q.total > 0) priced.push({ from: c.from, price: q.total }); } catch {}
       }
-      let narrowed = applyNarrowingFilter(priced, nf0);
+
+      // ENV override takes priority
+      const forcedDow = CHANGEOVER_BY_MONTH[month];
+      let usable = priced;
+      if (forcedDow != null) usable = filterByDow(usable, forcedDow);
+      else {
+        // Auto-detect dominant weekday if too many
+        if (usable.length > 6) {
+          const dom = dominantWeekday(usable);
+          if (dom != null) usable = filterByDow(usable, dom);
+        }
+      }
+
+      let narrowed = applyNarrowingFilter(usable, nf0);
       if (!narrowed.length) {
-        const example = priced.length ? priced[0].from : `${year}-${String(month).padStart(2,'0')}-18`;
+        const example = usable.length ? usable[0].from : `${year}-${String(month).padStart(2,'0')}-16`;
         const answer = `I couldn’t find priced options with that preference. Try a specific date (e.g., ${example}) or say “Fridays only”, “weekdays only”, “first half”, “second half”, “between 10th and 20th”, or “around the 18th”.`;
         addToHistory(conversationId, { role: 'assistant', content: answer });
         return res.json(okPayload(answer, history));
@@ -258,7 +316,7 @@ async function handleChat(req: express.Request, res: express.Response) {
       return res.json(okPayload(answer, history));
     }
 
-    // Not a narrowing cue — probe intent; if general, escape narrowing and answer via RAG.
+    // Not a narrowing cue — probe and possibly escape narrowing
     try {
       const intentProbe = await interpretMessageWithLLM(message);
       if (intentProbe.kind !== 'dates' && intentProbe.kind !== 'month') {
@@ -267,7 +325,6 @@ async function handleChat(req: express.Request, res: express.Response) {
         addToHistory(conversationId, { role: 'assistant', content: rag.answer });
         return res.json(okPayload(rag.answer, history));
       }
-      // else drop through to main intents
     } catch {
       pendingNarrowByConv.delete(conversationId);
       const rag = await answerWithContext(message, history);
@@ -287,12 +344,7 @@ async function handleChat(req: express.Request, res: express.Response) {
       if (!isRangeAvailable(from, nights)) {
         const alts = suggestAlternatives(from, nights, 16);
         const priced: { from: string; price: number }[] = [];
-        for (const a of alts) {
-          try {
-            const q = await quoteForStay({ from: a.from, nights: a.nights });
-            if (q.matchedNights && q.total > 0) priced.push({ from: a.from, price: q.total });
-          } catch {}
-        }
+        for (const a of alts) { try { const q = await quoteForStay({ from: a.from, nights: a.nights }); if (q.total > 0) priced.push({ from: a.from, price: q.total }); } catch {} }
         const lines = priced.slice(0, 6).map(v => `• ${v.from} — £${v.price.toFixed(2)}`).join('\n');
         const answer = `❌ Sorry, those dates look unavailable.${lines ? ` Closest priceable alternatives:\n${lines}` : ''}`;
         addToHistory(conversationId, { role: 'assistant', content: answer });
@@ -300,7 +352,7 @@ async function handleChat(req: express.Request, res: express.Response) {
       }
 
       const q = await quoteForStay({ from, nights });
-      if (!q.matchedNights || q.total <= 0) {
+      if (q.total <= 0) {
         const answer = 'That start date doesn’t look valid for that length. Would you like me to show valid start days near it?';
         addToHistory(conversationId, { role: 'assistant', content: answer });
         return res.json(okPayload(answer, history));
@@ -339,13 +391,22 @@ async function runMonthFlow(
   const { year, month, nights } = intent;
   const candidates = findAvailabilityInMonth(year, month, nights, 220);
 
-  // Keep only starts that Bookalet prices for EXACT nights
-  const valid: { from: string; price: number }[] = [];
+  // Keep only starts that Bookalet prices for EXACT nights (>0)
+  let valid: { from: string; price: number }[] = [];
   for (const c of candidates) {
     try {
       const q = await quoteForStay({ from: c.from, nights: c.nights });
-      if (q.matchedNights && q.total > 0) valid.push({ from: c.from, price: q.total });
+      if (q.total > 0) valid.push({ from: c.from, price: q.total });
     } catch {}
+  }
+
+  // Apply ENV override or auto-detect dominant weekday if too many remain
+  const forcedDow = CHANGEOVER_BY_MONTH[month];
+  if (forcedDow != null) {
+    valid = filterByDow(valid, forcedDow);
+  } else if (valid.length > 6) {
+    const dom = dominantWeekday(valid);
+    if (dom != null) valid = filterByDow(valid, dom);
   }
 
   if (!valid.length) {
@@ -356,7 +417,8 @@ async function runMonthFlow(
 
   if (valid.length > 6) {
     pendingNarrowByConv.set(conversationId, { year, month, nights });
-    const answer = `We have lots of dates available then. You can narrow it down with “Fridays only”, any weekday (e.g., “Monday”), “weekdays only”, “first/second week”, “first/second half”, “mid-month”, “between 10th and 20th”, “around the 18th”, “second Friday”, or say “next/previous” to change month.`;
+    const hint = (forcedDow != null) ? ` (changeover: ${DOW_TO_NAME[forcedDow]})` : '';
+    const answer = `We have lots of dates available then${hint}. You can narrow it down with “Fridays only”, any weekday (e.g., “Monday”), “weekdays only”, “first/second week”, “first/second half”, “mid-month”, “between 10th and 20th”, “around the 18th”, “second Friday”, or say “next/previous” to change month.`;
     addToHistory(conversationId, { role: 'assistant', content: answer });
     return res.json(okPayload(answer, history));
   }
