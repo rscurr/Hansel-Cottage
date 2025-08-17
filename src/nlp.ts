@@ -1,71 +1,61 @@
-// LLM-only booking intent extraction.
-// Returns { kind:'dates', from:'YYYY-MM-DD', nights:number, dogs:number } or { kind:'none' }.
+// src/nlp.ts
+import type { z } from 'zod';
 
-export type Intent =
-  | { kind: 'dates'; from: string; nights: number; dogs: number }
-  | { kind: 'none' };
+export type DatesIntent = { kind: 'dates'; from: string; nights: number; year: number; month: number };
+export type MonthIntent = { kind: 'month'; year: number; month: number; nights: number };
+export type UnknownIntent = { kind: 'unknown' };
+export type Intent = DatesIntent | MonthIntent | UnknownIntent;
 
-function todayLondonISO(): string {
+function toMonthYearGuess(): { year: number; month: number } {
   const now = new Date();
-  const parts = new Intl.DateTimeFormat('en-GB', {
-    timeZone: 'Europe/London',
-    year: 'numeric', month: '2-digit', day: '2-digit'
-  }).formatToParts(now);
-  const y = parts.find(p => p.type === 'year')!.value;
-  const m = parts.find(p => p.type === 'month')!.value;
-  const d = parts.find(p => p.type === 'day')!.value;
-  return `${y}-${m}-${d}`;
+  return { year: now.getUTCFullYear(), month: now.getUTCMonth() + 1 };
 }
 
 export async function interpretMessageWithLLM(message: string): Promise<Intent> {
-  const key = process.env.OPENAI_API_KEY || '';
-  if (!key) return { kind: 'none' };
+  const apiKey = process.env.OPENAI_API_KEY;
+  // Heuristic first: ISO date and "for N nights"
+  const date = message.match(/\b(\d{4}-\d{2}-\d{2})\b/)?.[1];
+  const nightsStr = message.toLowerCase().match(/\bfor\s+(\d{1,2})\s+nights?\b/)?.[1] ||
+                    message.toLowerCase().match(/\b(\d{1,2})\s+nights?\b/)?.[1];
+  if (date) {
+    const nights = nightsStr ? Math.max(1, Math.min(30, parseInt(nightsStr, 10))) : 7;
+    const d = new Date(date + 'T00:00:00Z');
+    return { kind: 'dates', from: date, nights, year: d.getUTCFullYear(), month: d.getUTCMonth() + 1 };
+  }
 
-  const todayISO = todayLondonISO();
-  const body = {
-    model: 'gpt-4o-mini',
-    temperature: 0,
-    response_format: { type: 'json_object' },
-    messages: [
-      {
-        role: 'system',
-        content:
-`You extract booking details for a UK holiday cottage.
-Output strict JSON like:
-{"from":"YYYY-MM-DD","nights":number,"dogs":number}
+  if (!apiKey) return { kind: 'unknown' };
+
+  const system = `Extract intent:
+- If user asks about a specific start date and length, return JSON: {"kind":"dates","from":"YYYY-MM-DD","nights":N,"year":YYYY,"month":M}
+- If user asks about availability in a month, return JSON: {"kind":"month","year":YYYY,"month":M,"nights":N}
+- Otherwise: {"kind":"unknown"}
+
 Rules:
-- Interpret relative dates using Europe/London and today's date: ${todayISO}.
-- If a week is mentioned, nights=7.
-- If a date range like "from X to/until Y" is given, nights = days between start and end.
-- If nights is not stated but a start date exists, assume nights=7.
-- Dogs default to 0 if not stated.
-- "This weekend" means Friday + 2 nights.
-Only output JSON, no extra text.`
-      },
-      { role: 'user', content: message }
-    ]
-  };
+- If nights unspecified, default to 7.
+- Recognize “a week” as 7 nights, “long weekend” as 3 nights.
+- Months may omit year; assume this year or next if past.`;
 
   const res = await fetch('https://api.openai.com/v1/chat/completions', {
     method: 'POST',
-    headers: { 'Content-Type': 'application/json', 'Authorization': `Bearer ${key}` },
-    body: JSON.stringify(body)
+    headers: { 'Content-Type': 'application/json', Authorization: `Bearer ${apiKey}` },
+    body: JSON.stringify({
+      model: 'gpt-4o-mini',
+      temperature: 0,
+      messages: [
+        { role: 'system', content: system },
+        { role: 'user', content: message }
+      ]
+    })
   });
-  if (!res.ok) throw new Error(`chat failed: ${res.status}`);
-  const j = await res.json();
-  const raw = j.choices?.[0]?.message?.content;
-  if (!raw) return { kind: 'none' };
 
+  if (!res.ok) return { kind: 'unknown' };
+  const data: any = await res.json();
+  const txt = String(data.choices?.[0]?.message?.content || '').trim();
   try {
-    const parsed = JSON.parse(raw);
-    if (
-      typeof parsed.from === 'string' && /^\d{4}-\d{2}-\d{2}$/.test(parsed.from) &&
-      typeof parsed.nights === 'number' && parsed.nights > 0
-    ) {
-      const nights = Math.min(Math.max(1, Math.round(parsed.nights)), 30);
-      const dogs = Math.max(0, Math.min(4, Math.round(parsed.dogs || 0)));
-      return { kind: 'dates', from: parsed.from, nights, dogs };
-    }
+    const obj = JSON.parse(txt);
+    if (obj && obj.kind === 'dates' && obj.from && obj.nights) return obj;
+    if (obj && obj.kind === 'month' && obj.month) return obj;
   } catch { /* ignore */ }
-  return { kind: 'none' };
+
+  return { kind: 'unknown' };
 }
