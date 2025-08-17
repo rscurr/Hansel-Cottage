@@ -10,7 +10,7 @@ type QuoteInput = {
   adults?: number;
   children?: number;
   infants?: number;
-  dogs?: number;        // ignored by Bookalet API; keep for interface compatibility
+  dogs?: number;        // ignored by Bookalet API; kept for interface compatibility
 };
 
 export type QuoteResult = {
@@ -19,11 +19,8 @@ export type QuoteResult = {
   matchedNights: boolean;   // true only when Days === nights was found
 };
 
-// Your Bookalet owner/property IDs
 const BOOKALET_OWNER = process.env.BOOKALET_OWNER || '17103';
 const BOOKALET_PROPERTY = process.env.BOOKALET_PROPERTY || '42069';
-
-// Node 18+ has global fetch. If on older Node, you'd import('node-fetch').
 
 export async function quoteForStay(input: QuoteInput): Promise<QuoteResult> {
   const {
@@ -34,7 +31,6 @@ export async function quoteForStay(input: QuoteInput): Promise<QuoteResult> {
     infants = 0,
   } = input;
 
-  // Construct Bookalet "bookable" endpoint
   const u = new URL('https://widgets.bookalet.co.uk/api/bookable');
   u.searchParams.set('owner', BOOKALET_OWNER);
   u.searchParams.set('property', BOOKALET_PROPERTY);
@@ -44,24 +40,19 @@ export async function quoteForStay(input: QuoteInput): Promise<QuoteResult> {
   u.searchParams.set('adults', String(adults));
   u.searchParams.set('children', String(children));
   u.searchParams.set('infants', String(infants));
-  u.searchParams.set('exchange', ''); // keep native currency
+  u.searchParams.set('exchange', '');
 
   try {
     const resp = await fetch(u.toString(), { headers: { 'Accept': 'application/json' } });
-    if (!resp.ok) {
-      // Treat as not priceable
-      return { currency: 'GBP', total: 0, matchedNights: false };
-    }
+    if (!resp.ok) return { currency: 'GBP', total: 0, matchedNights: false };
     const data = await resp.json();
-    // Bookalet returns an array of options for different Days.
-    // We ONLY accept a row where Days === nights.
+
     const row = Array.isArray(data)
       ? data.find((r: any) => Number(r?.Days) === nights)
       : null;
 
     if (!row) return { currency: 'GBP', total: 0, matchedNights: false };
 
-    // Total = Cost - Discount (if any)
     const cost = Number(row.Cost ?? 0);
     const disc = Number(row.Discount ?? 0);
     const total = Math.max(0, cost - disc);
