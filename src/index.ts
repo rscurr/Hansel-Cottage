@@ -1,9 +1,10 @@
 // src/index.ts
+//
 // Hansel Cottage chatbot server (compat mode).
-// - ICS scan + Bookalet price validation
+// - ICS scan + Bookalet price validation (strict: Days === nights)
 // - RAG for PDFs/site
-// - Flexible narrowing follow-ups, but auto-escapes narrowing when the next turn isn't about dates
-// - Accepts {message}|{text}|{question}; optional conversationId (auto if missing)
+// - Flexible narrowing follow-ups with escape to general Q&A
+// - Accepts {message}|{text}|{question}; optional conversationId
 // - Returns {answer, reply, message, text, success, history}
 // - /chat and /api/chat routes
 // - PDF boot ingest logs
@@ -33,7 +34,7 @@ import { extractPdfTextFromUrl, extractPdfTextFromFile } from './pdf.js';
 
 const PORT = Number(process.env.PORT || 3000);
 
-/* ---------- CORS (comma-separated origins, null allowed for local files) ---------- */
+/* ---------- CORS ---------- */
 const allowedList = (process.env.ALLOWED_ORIGIN || '*')
   .split(',')
   .map(s => s.trim())
@@ -53,7 +54,7 @@ app.use(cors({
 app.options('*', cors());
 app.use(bodyParser.json());
 
-// Serve static (for /public PDFs)
+/* ---------- Static (PDFs) ---------- */
 const publicDir = path.resolve(process.cwd(), 'public');
 app.use(express.static(publicDir));
 
@@ -91,7 +92,7 @@ function isoFromBody(body: any): string | null {
   return m ? m[1] : null;
 }
 
-/* ---------- Flexible narrowing parsing ---------- */
+/* ---------- Narrowing parsing ---------- */
 const WEEKDAY_NAMES: Record<string, number> = {
   sunday: 0, sun: 0, monday: 1, mon: 1, tuesday: 2, tue: 2, tues: 2,
   wednesday: 3, wed: 3, thursday: 4, thu: 4, thurs: 4, friday: 5, fri: 5, saturday: 6, sat: 6
@@ -120,7 +121,6 @@ function parseOrdinalWord(t: string): 1|2|3|4|5|null {
   if (/\b(fifth|5th)\b/.test(t)) return 5;
   return null;
 }
-
 function parseNarrowing(msg: string): NarrowFilter | null {
   const t = msg.trim().toLowerCase();
   const dateMatch = t.match(/\b(\d{4}-\d{2}-\d{2})\b/);
@@ -160,10 +160,23 @@ function applyNarrowingFilter(dates: Array<{ from: string; price: number }>, f: 
     case 'late': return byDay(day => day >= 21);
     case 'firsthalf': return byDay(day => day <= 15);
     case 'secondhalf': return byDay(day => day >= 16);
-    case 'around': return dates.filter(d => { const day = getDate(parseISO(d.from)); const ok = Math.abs(day - f.day) <= 3; if (f.dow == null) return ok; const dow = getDay(parseISO(d.from)); return ok && dow === f.dow; });
+    case 'around': return dates.filter(d => {
+      const day = getDate(parseISO(d.from));
+      const ok = Math.abs(day - f.day) <= 3;
+      if (f.dow == null) return ok;
+      const dow = getDay(parseISO(d.from));
+      return ok && dow === f.dow;
+    });
     case 'dayrange': return byDay(day => day >= f.lo && day <= f.hi);
     case 'weeknum': { const ranges: Record<number,[number,number]> = {1:[1,7],2:[8,14],3:[15,21],4:[22,28],5:[29,31]}; const [lo,hi]=ranges[f.n]; return byDay(day => day >= lo && day <= hi); }
-    case 'nthWeekday': { const ranges: Record<number,[number,number]> = {1:[1,7],2:[8,14],3:[15,21],4:[22,28],5:[29,31]}; const [lo,hi]=ranges[f.n]; return dates.filter(d => { const dt=parseISO(d.from); const day=getDate(dt); const dow=getDay(dt); return (day>=lo && day<=hi) && (dow===f.dow); }); }
+    case 'nthWeekday': {
+      const ranges: Record<number,[number,number]> = {1:[1,7],2:[8,14],3:[15,21],4:[22,28],5:[29,31]};
+      const [lo,hi]=ranges[f.n];
+      return dates.filter(d => {
+        const dt=parseISO(d.from); const day=getDate(dt); const dow=getDay(dt);
+        return (day>=lo && day<=hi) && (dow===f.dow);
+      });
+    }
   }
 }
 
@@ -178,7 +191,7 @@ async function handleChat(req: express.Request, res: express.Response) {
   const history = getHistory(conversationId);
   addToHistory(conversationId, { role: 'user', content: message });
 
-  // If we’re in a narrowing state, only use it when the message is really a narrowing cue.
+  // If narrowing is pending, only use it on actual narrowing cues; else fall back to RAG.
   let pending = pendingNarrowByConv.get(conversationId);
   if (pending) {
     const navNext = /^\s*next\s*$/i.test(message);
@@ -205,8 +218,8 @@ async function handleChat(req: express.Request, res: express.Response) {
         return res.json(okPayload(answer, history));
       }
       const q = await quoteForStay({ from: explicitDate, nights });
-      if (q.total <= 0) {
-        const answer = 'That date doesn’t appear to be a valid start day. Would you like me to show valid (priced) starts for that period?';
+      if (!q.matchedNights || q.total <= 0) {
+        const answer = 'That date doesn’t appear to be a valid start day for that length. Want me to show valid (priced) starts?';
         addToHistory(conversationId, { role: 'assistant', content: answer });
         return res.json(okPayload(answer, history));
       }
@@ -222,7 +235,10 @@ async function handleChat(req: express.Request, res: express.Response) {
       const candidates = findAvailabilityInMonth(year, month, nights, 200);
       const priced: { from: string; price: number }[] = [];
       for (const c of candidates) {
-        try { const q = await quoteForStay({ from: c.from, nights: c.nights }); if (q.total > 0) priced.push({ from: c.from, price: q.total }); } catch {}
+        try {
+          const q = await quoteForStay({ from: c.from, nights: c.nights });
+          if (q.matchedNights && q.total > 0) priced.push({ from: c.from, price: q.total });
+        } catch {}
       }
       let narrowed = applyNarrowingFilter(priced, nf0);
       if (!narrowed.length) {
@@ -242,18 +258,17 @@ async function handleChat(req: express.Request, res: express.Response) {
       return res.json(okPayload(answer, history));
     }
 
-    // Not a narrowing cue — ask LLM what this message is. If it's not a dates/month intent, exit narrowing and answer normally.
+    // Not a narrowing cue — probe intent; if general, escape narrowing and answer via RAG.
     try {
       const intentProbe = await interpretMessageWithLLM(message);
       if (intentProbe.kind !== 'dates' && intentProbe.kind !== 'month') {
-        pendingNarrowByConv.delete(conversationId); // <-- escape narrowing
+        pendingNarrowByConv.delete(conversationId);
         const rag = await answerWithContext(message, history);
         addToHistory(conversationId, { role: 'assistant', content: rag.answer });
         return res.json(okPayload(rag.answer, history));
       }
-      // if it *is* a dates/month intent, continue below to the main intent handler
+      // else drop through to main intents
     } catch {
-      // If the probe fails, be safe: clear narrowing and answer normally.
       pendingNarrowByConv.delete(conversationId);
       const rag = await answerWithContext(message, history);
       addToHistory(conversationId, { role: 'assistant', content: rag.answer });
@@ -261,7 +276,7 @@ async function handleChat(req: express.Request, res: express.Response) {
     }
   }
 
-  // ---- No (active) narrowing, run main intents ----
+  // ---- No active narrowing: run main intents ----
   try {
     const intent = await interpretMessageWithLLM(message);
 
@@ -272,7 +287,12 @@ async function handleChat(req: express.Request, res: express.Response) {
       if (!isRangeAvailable(from, nights)) {
         const alts = suggestAlternatives(from, nights, 16);
         const priced: { from: string; price: number }[] = [];
-        for (const a of alts) { try { const q = await quoteForStay({ from: a.from, nights: a.nights }); if (q.total > 0) priced.push({ from: a.from, price: q.total }); } catch {} }
+        for (const a of alts) {
+          try {
+            const q = await quoteForStay({ from: a.from, nights: a.nights });
+            if (q.matchedNights && q.total > 0) priced.push({ from: a.from, price: q.total });
+          } catch {}
+        }
         const lines = priced.slice(0, 6).map(v => `• ${v.from} — £${v.price.toFixed(2)}`).join('\n');
         const answer = `❌ Sorry, those dates look unavailable.${lines ? ` Closest priceable alternatives:\n${lines}` : ''}`;
         addToHistory(conversationId, { role: 'assistant', content: answer });
@@ -280,6 +300,11 @@ async function handleChat(req: express.Request, res: express.Response) {
       }
 
       const q = await quoteForStay({ from, nights });
+      if (!q.matchedNights || q.total <= 0) {
+        const answer = 'That start date doesn’t look valid for that length. Would you like me to show valid start days near it?';
+        addToHistory(conversationId, { role: 'assistant', content: answer });
+        return res.json(okPayload(answer, history));
+      }
       const answer = `✅ Available from ${from} for ${nights} night(s). Estimated total: GBP ${q.total.toFixed(2)}. Would you like the booking link?`;
       addToHistory(conversationId, { role: 'assistant', content: answer });
       return res.json(okPayload(answer, history));
@@ -314,9 +339,13 @@ async function runMonthFlow(
   const { year, month, nights } = intent;
   const candidates = findAvailabilityInMonth(year, month, nights, 220);
 
+  // Keep only starts that Bookalet prices for EXACT nights
   const valid: { from: string; price: number }[] = [];
   for (const c of candidates) {
-    try { const q = await quoteForStay({ from: c.from, nights: c.nights }); if (q.total > 0) valid.push({ from: c.from, price: q.total }); } catch {}
+    try {
+      const q = await quoteForStay({ from: c.from, nights: c.nights });
+      if (q.matchedNights && q.total > 0) valid.push({ from: c.from, price: q.total });
+    } catch {}
   }
 
   if (!valid.length) {
@@ -340,7 +369,7 @@ async function runMonthFlow(
   return res.json(okPayload(answer, history));
 }
 
-/* ---------- Routes (both /chat and /api/chat) ---------- */
+/* ---------- Routes ---------- */
 app.post('/chat', handleChat);
 app.post('/api/chat', handleChat);
 
