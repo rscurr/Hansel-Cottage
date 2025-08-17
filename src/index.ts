@@ -157,7 +157,6 @@ function buildISO(y: number, m: number, d: number) {
 
 /** Get the ISO date for the Nth weekday of a given month (n=1..5). Returns null if that nth doesn't exist. */
 function nthWeekdayISO(year: number, month: number, dow: number, n: 1|2|3|4|5): string | null {
-  // Find first occurrence of dow in the month
   const dim = getDaysInMonth(new Date(year, month - 1, 1));
   let firstDowDay = -1;
   for (let d = 1; d <= 7; d++) {
@@ -177,26 +176,12 @@ function lastWeekdayISO(year: number, month: number, dow: number): string {
     const dt = new Date(year, month - 1, d);
     if (dt.getDay() === dow) return buildISO(year, month, d);
   }
-  // Fallback (shouldn't happen)
   return buildISO(year, month, dim);
 }
 
 /**
  * Parse many human-friendly date formats into ISO (YYYY-MM-DD).
  * If year or month are missing, use fallbackYear/fallbackMonth (the month currently being discussed).
- * Accepted variants include:
- *  - "Mon 31 Aug" / "31 Aug" / "Aug 31" / "31 Aug 2026" / "August 31 2026" / "2026 Aug 31"
- *  - "31/08/2026" / "31-08-2026" / "31.08.2026"
- *  - "31/08" / "31-08" (uses fallback year)
- *  - "2026/08/31" / "2026-08-31"
- *  - "08/31/2026" (US format)
- *  - "31" (uses fallback year/month)
- *  - "the 31st" / "31st" (uses fallback year/month)
- *  - "early August" / "mid August" / "late August" / "end of Aug"
- *  - "early month" / "mid-month" / "late month" / "end of month"
- *  - NEW: "last Friday of Aug(ust) [2026]" → exact ISO using month in phrase
- *  - NEW: "2nd Friday of August [2026]" / "third Monday of Sep 2026" → exact ISO using month in phrase
- *  - NEW: "last Friday" / "2nd Friday" (uses fallback month/year)
  */
 function parseHumanDateInMonth(
   text: string,
@@ -205,7 +190,6 @@ function parseHumanDateInMonth(
 ): string | null {
   const t = text.trim().toLowerCase().replace(/\s+/g, ' ');
 
-  // Quick helpers
   const tryWithFallback = (day: number) => {
     if (fallbackYear && fallbackMonth) return buildISO(fallbackYear, fallbackMonth, day);
     return null;
@@ -226,7 +210,7 @@ function parseHumanDateInMonth(
     }
   }
 
-  // A2) Vague month phrases without explicit month
+  // A2) Vague month phrases without explicit month (use fallback month)
   m = t.match(/\b(early|mid(?:-|\s)?month|late|end(?:\s+of)?\s+month|end(?:\s+of)?)\b/);
   if (m && fallbackYear && fallbackMonth) {
     const phrase = m[1];
@@ -259,7 +243,6 @@ function parseHumanDateInMonth(
         const n = ordMap[ordRaw as keyof typeof ordMap];
         if (n) {
           const iso = nthWeekdayISO(y, mo, dow, n);
-          // If nth doesn’t exist (e.g., 5th Friday in a 4-Friday month), fall back to LAST
           return iso ?? lastWeekdayISO(y, mo, dow);
         }
       }
@@ -351,22 +334,13 @@ function parseHumanDateInMonth(
 
 /* ---------- Narrowing parsing ---------- */
 const WEEKDAY_NAMES: Record<string, number> = {
-  sunday: 0,
-  sun: 0,
-  monday: 1,
-  mon: 1,
-  tuesday: 2,
-  tue: 2,
-  tues: 2,
-  wednesday: 3,
-  wed: 3,
-  thursday: 4,
-  thu: 4,
-  thurs: 4,
-  friday: 5,
-  fri: 5,
-  saturday: 6,
-  sat: 6,
+  sunday: 0, sun: 0,
+  monday: 1, mon: 1,
+  tuesday: 2, tue: 2, tues: 2,
+  wednesday: 3, wed: 3,
+  thursday: 4, thu: 4, thurs: 4, thursday: 4,
+  friday: 5, fri: 5,
+  saturday: 6, sat: 6,
 };
 
 type NarrowFilter =
@@ -402,8 +376,7 @@ function parseNarrowing(msg: string): NarrowFilter | null {
   if (dateMatch) return { kind: 'date', date: dateMatch[1] };
 
   if (/\b(friday|fridays)\b/.test(t)) return { kind: 'fridays' };
-  if (/\b(weekday|weekdays|midweek|mid-week)\b/.test(t))
-    return { kind: 'weekdays' };
+  if (/\b(weekday|weekdays|midweek|mid-week)\b/.test(t)) return { kind: 'weekdays' };
   if (/\b(weekend|weekends)\b/.test(t)) return { kind: 'weekends' };
 
   for (const name in WEEKDAY_NAMES) {
@@ -417,11 +390,7 @@ function parseNarrowing(msg: string): NarrowFilter | null {
     return { kind: 'lastWeekday', dow: dowMap[wdKey] };
   }
 
-  if (
-    /\b(first|1st|second|2nd|third|3rd|fourth|4th|fifth|5th)\s+(mon|monday|tue|tues|tuesday|wed|wednesday|thu|thurs|thursday|fri|friday|sat|saturday|sun|sunday)\b/.test(
-      t
-    )
-  ) {
+  if (/\b(first|1st|second|2nd|third|3rd|fourth|4th|fifth|5th)\s+(mon|monday|tue|tues|tuesday|wed|wednesday|thu|thurs|thursday|fri|friday|sat|saturday|sun|sunday)\b/.test(t)) {
     const m2 = t.match(/\b(first|1st|second|2nd|third|3rd|fourth|4th|fifth|5th)\s+(mon|monday|tue|tues|tuesday|wed|wednesday|thu|thurs|thursday|fri|friday|sat|saturday|sun|sunday)\b/)!;
     const wdKey = m2[2];
     const dowMap: Record<string, number> = { mon:1,monday:1,tue:2,tues:2,tuesday:2,wed:3,wednesday:3,thu:4,thurs:4,thursday:4,fri:5,friday:5,sat:6,saturday:6,sun:0,sunday:0 };
@@ -429,32 +398,20 @@ function parseNarrowing(msg: string): NarrowFilter | null {
     return { kind: 'nthWeekday', n: ordMap[m2[1] as keyof typeof ordMap], dow: dowMap[wdKey] };
   }
 
-  if (
-    /\b(first\s+half|1st\s+half|first\s+part|beginning\s+of\s+the\s+month)\b/.test(
-      t
-    )
-  )
-    return { kind: 'firsthalf' };
-  if (
-    /\b(second\s+half|2nd\s+half|last\s+half|end\s+of\s+the\s+month)\b/.test(t)
-  )
-    return { kind: 'secondhalf' };
+  if (/\b(first\s+half|1st\s+half|first\s+part|beginning\s+of\s+the\s+month)\b/.test(t)) return { kind: 'firsthalf' };
+  if (/\b(second\s+half|2nd\s+half|last\s+half|end\s+of\s+the\s+month)\b/.test(t)) return { kind: 'secondhalf' };
   if (/\b(mid[-\s]?month|middle)\b/.test(t)) return { kind: 'mid' };
   if (/\b(early|start|beginning)\b/.test(t)) return { kind: 'early' };
   if (/\b(late|end|ending|last)\b/.test(t)) return { kind: 'late' };
 
-  const aroundWk = t.match(
-    /\baround(?:\s+(mon|monday|tue|tues|tuesday|wed|wednesday|thu|thurs|thursday|fri|friday|sat|saturday|sun|sunday))?(?:\s+the)?\s+(\d{1,2})(?:st|nd|rd|th)?\b/
-  );
+  const aroundWk = t.match(/\baround(?:\s+(mon|monday|tue|tues|tuesday|wed|wednesday|thu|thurs|thursday|fri|friday|sat|saturday|sun|sunday))?(?:\s+the)?\s+(\d{1,2})(?:st|nd|rd|th)?\b/);
   if (aroundWk) {
     const wd = aroundWk[1] ? WEEKDAY_NAMES[aroundWk[1]] : undefined;
     const d = parseInt(aroundWk[2], 10);
     if (d >= 1 && d <= 31) return { kind: 'around', day: d, dow: wd };
   }
 
-  const range1 = t.match(
-    /\b(\d{1,2})(?:st|nd|rd|th)?\s*(?:-|to|–|—|and)\s*(\d{1,2})(?:st|nd|rd|th)?\b/
-  );
+  const range1 = t.match(/\b(\d{1,2})(?:st|nd|rd|th)?\s*(?:-|to|–|—|and)\s*(\d{1,2})(?:st|nd|rd|th)?\b/);
   if (range1) {
     const lo = parseInt(range1[1], 10);
     const hi = parseInt(range1[2], 10);
@@ -539,7 +496,6 @@ function applyNarrowingFilter(
       });
     }
     case 'lastWeekday': {
-      // Pick the maximum date among those matching the weekday
       const candidates = dates.filter((d) => getDay(parseISO(d.from)) === f.dow);
       if (!candidates.length) return [];
       const maxIso = candidates
@@ -569,7 +525,6 @@ async function handleChat(req: express.Request, res: express.Response) {
     const navNext = /^\s*next\s*$/i.test(message);
     const navPrev = /^\s*prev(ious)?\s*$/i.test(message);
     const explicitIso = isoFromBody(body);
-    // Parse "Mon 31 Aug", "2nd Friday of Aug", "end of month", etc. using pending month/year as context
     const humanIso = parseHumanDateInMonth(message, pending.year, pending.month);
     const nf0 = parseNarrowing(message);
 
@@ -610,7 +565,7 @@ async function handleChat(req: express.Request, res: express.Response) {
         addToHistory(conversationId, { role: 'assistant', content: answer });
         return res.json(okPayload(answer, history));
       }
-      const answer = `✅ Available from ${formatDate(explicitDate)} for ${nights} night(s). Estimated total: GBP ${q.total.toFixed(2)}. Would you like the booking link?`;
+      const answer = `✅ Available from ${formatDate(explicitDate)} for ${nights} night(s). Estimated total: GBP ${q.total.toFixed(2)}. You can book on our [availability page](https://www.hanselcottage.com/availability).`;
       addToHistory(conversationId, { role: 'assistant', content: answer });
       pendingNarrowByConv.delete(conversationId);
       return res.json(okPayload(answer, history));
@@ -637,12 +592,10 @@ async function handleChat(req: express.Request, res: express.Response) {
       }
 
       const lines = narrowed.map((v) => `• ${formatDate(v.from)} (${nights} nights) — £${v.price.toFixed(2)}`).join('\n');
-      const answer = `Here are the options I found:\n${lines}\n\nTell me which date you prefer.`;
+      const answer = `Here are the options I found:\n${lines}\n\nYou can book on our [availability page](https://www.hanselcottage.com/availability).`;
       addToHistory(conversationId, { role: 'assistant', content: answer });
       return res.json(okPayload(answer, history));
     }
-
-    // If it's not a narrowing cue, we might be switching topics → fall through to main intent parsing
   }
 
   // ---- Main intent parsing ----
@@ -668,7 +621,7 @@ async function handleChat(req: express.Request, res: express.Response) {
           return res.json(okPayload(answer, history));
         }
         const lines = priced.map((v) => `• ${formatDate(v.from)} — £${v.price.toFixed(2)}`).join('\n');
-        const answer = `❌ Sorry, those dates look unavailable. Here are some priceable alternatives:\n${lines}`;
+        const answer = `❌ Sorry, those dates look unavailable. Here are some priceable alternatives:\n${lines}\n\nYou can book on our [availability page](https://www.hanselcottage.com/availability).`;
         addToHistory(conversationId, { role: 'assistant', content: answer });
         return res.json(okPayload(answer, history));
       }
@@ -680,7 +633,7 @@ async function handleChat(req: express.Request, res: express.Response) {
         return res.json(okPayload(answer, history));
       }
 
-      const answer = `✅ Available from ${formatDate(from)} for ${nights} night(s). Estimated total: GBP ${q.total.toFixed(2)}. Would you like the booking link?`;
+      const answer = `✅ Available from ${formatDate(from)} for ${nights} night(s). Estimated total: GBP ${q.total.toFixed(2)}. You can book on our [availability page](https://www.hanselcottage.com/availability).`;
       addToHistory(conversationId, { role: 'assistant', content: answer });
       return res.json(okPayload(answer, history));
     }
@@ -738,7 +691,7 @@ async function runMonthFlow(
   const answer = `Here are all priceable start dates in ${year}-${String(month).padStart(
     2,
     '0'
-  )} for ${nights} night(s):\n${lines}\n\nTell me which one you’d like and I can give you the booking steps.`;
+  )} for ${nights} night(s):\n${lines}\n\nYou can book on our [availability page](https://www.hanselcottage.com/availability).`;
 
   addToHistory(conversationId, { role: 'assistant', content: answer });
   return res.json(okPayload(answer, history));
