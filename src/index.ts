@@ -4,10 +4,8 @@
 // - ICS scan + Bookalet price validation (strict: Days === nights & total > 0)
 // - RAG for PDFs/site
 // - Flexible narrowing follow-ups with escape to general Q&A
-// - Accepts {message}|{text}|{question}; optional conversationId
-// - Returns {answer, reply, message, text, success, history}
-// - /chat and /api/chat routes
-// - PDF boot ingest logs
+// - ACCEPTS message|text|question; optional conversationId
+// - ALWAYS returns all priceable start dates (no 6-result cap)
 // - Node16 module resolution friendly (.js imports)
 
 import express from 'express';
@@ -232,7 +230,7 @@ async function handleChat(req: express.Request, res: express.Response) {
     if (nf0) {
       const { year, month, nights } = pending;
       await refreshIcs();
-      const candidates = findAvailabilityInMonth(year, month, nights, 200);
+      const candidates = findAvailabilityInMonth(year, month, nights, 500);
       const priced: { from: string; price: number }[] = [];
       for (const c of candidates) {
         try {
@@ -241,6 +239,7 @@ async function handleChat(req: express.Request, res: express.Response) {
         } catch {}
       }
 
+      // Apply the user's narrowing filter, then list ALL results
       let narrowed = applyNarrowingFilter(priced, nf0);
       if (!narrowed.length) {
         const example = priced.length ? priced[0].from : `${year}-${String(month).padStart(2,'0')}-18`;
@@ -248,12 +247,8 @@ async function handleChat(req: express.Request, res: express.Response) {
         addToHistory(conversationId, { role: 'assistant', content: answer });
         return res.json(okPayload(answer, history));
       }
-      if (narrowed.length > 6) {
-        const answer = `There are still quite a few options. Could you pick a specific date in that range (e.g., ${narrowed[0].from})?`;
-        addToHistory(conversationId, { role: 'assistant', content: answer });
-        return res.json(okPayload(answer, history));
-      }
-      const lines = narrowed.slice(0, 6).map(v => `• ${v.from} (${nights} nights) — £${v.price.toFixed(2)}`).join('\n');
+
+      const lines = narrowed.map(v => `• ${v.from} (${nights} nights) — £${v.price.toFixed(2)}`).join('\n');
       const answer = `Here are the options I found:\n${lines}\n\nTell me which date you prefer.`;
       addToHistory(conversationId, { role: 'assistant', content: answer });
       return res.json(okPayload(answer, history));
@@ -285,7 +280,7 @@ async function handleChat(req: express.Request, res: express.Response) {
       const { from, nights } = intent;
 
       if (!isRangeAvailable(from, nights)) {
-        const alts = suggestAlternatives(from, nights, 16);
+        const alts = suggestAlternatives(from, nights, 30);
         const priced: { from: string; price: number }[] = [];
         for (const a of alts) {
           try {
@@ -293,8 +288,13 @@ async function handleChat(req: express.Request, res: express.Response) {
             if (q.matchedNights && q.total > 0) priced.push({ from: a.from, price: q.total });
           } catch {}
         }
-        const lines = priced.slice(0, 6).map(v => `• ${v.from} — £${v.price.toFixed(2)}`).join('\n');
-        const answer = `❌ Sorry, those dates look unavailable.${lines ? ` Closest priceable alternatives:\n${lines}` : ''}`;
+        if (!priced.length) {
+          const answer = `❌ Sorry, those dates look unavailable.`;
+          addToHistory(conversationId, { role: 'assistant', content: answer });
+          return res.json(okPayload(answer, history));
+        }
+        const lines = priced.map(v => `• ${v.from} — £${v.price.toFixed(2)}`).join('\n');
+        const answer = `❌ Sorry, those dates look unavailable. Here are some priceable alternatives:\n${lines}`;
         addToHistory(conversationId, { role: 'assistant', content: answer });
         return res.json(okPayload(answer, history));
       }
@@ -327,7 +327,7 @@ async function handleChat(req: express.Request, res: express.Response) {
   }
 }
 
-/* ---------- Month flow helper ---------- */
+/* ---------- Month flow helper (returns ALL priceable starts) ---------- */
 async function runMonthFlow(
   intent: { kind: 'month'; year: number; month: number; nights: number },
   conversationId: string,
@@ -337,7 +337,7 @@ async function runMonthFlow(
 ) {
   await refreshIcs();
   const { year, month, nights } = intent;
-  const candidates = findAvailabilityInMonth(year, month, nights, 220);
+  const candidates = findAvailabilityInMonth(year, month, nights, 1000);
 
   // Keep only starts that Bookalet prices for EXACT nights (>0)
   const valid: { from: string; price: number }[] = [];
@@ -354,17 +354,10 @@ async function runMonthFlow(
     return res.json(okPayload(answer, history));
   }
 
-  if (valid.length > 6) {
-    pendingNarrowByConv.set(conversationId, { year, month, nights });
-    const answer = `We have lots of dates available then. You can narrow it down with “Fridays only”, any weekday (e.g., “Monday”), “weekdays only”, “first/second week”, “first/second half”, “mid-month”, “between 10th and 20th”, “around the 18th”, “second Friday”, or say “next/previous” to change month.`;
-    addToHistory(conversationId, { role: 'assistant', content: answer });
-    return res.json(okPayload(answer, history));
-  }
-
   if (!keepPending) pendingNarrowByConv.delete(conversationId);
 
-  const lines = valid.slice(0, 6).map(v => `• ${v.from} (${nights} nights) — £${v.price.toFixed(2)}`).join('\n');
-  const answer = `Here are the available start dates in ${year}-${String(month).padStart(2,'0')} for ${nights} night(s):\n${lines}\n\nTell me which one you’d like and I can give you the booking steps.`;
+  const lines = valid.map(v => `• ${v.from} (${nights} nights) — £${v.price.toFixed(2)}`).join('\n');
+  const answer = `Here are all priceable start dates in ${year}-${String(month).padStart(2,'0')} for ${nights} night(s):\n${lines}\n\nTell me which one you’d like and I can give you the booking steps.`;
   addToHistory(conversationId, { role: 'assistant', content: answer });
   return res.json(okPayload(answer, history));
 }
