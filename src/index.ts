@@ -7,10 +7,8 @@
 // - PDF and website RAG ingest on boot
 // - Dates shown as "Fri 10 May"
 // - Returns ALL priceable starts (no 6-cap)
-// - FLEX DATE INPUTS: rich natural date parsing including
-//   "Mon 31 Aug", "31 Aug", "Aug 31", "31/08/2026", "31-08", "2026/08/31", "08/31/2026",
-//   "the 31st", "end of Aug", "early/mid/late August", "end of month", "mid-month",
-//   "last Friday (of Aug 2026)", "2nd Friday of August", "third Monday of Sep 2026", etc.
+// - Flexible date/narrowing parsing
+// - Booking CTA uses Markdown link: [book here](https://www.hanselcottage.com/availability)
 
 import express from 'express';
 import cors from 'cors';
@@ -37,19 +35,48 @@ import { extractPdfTextFromUrl, extractPdfTextFromFile } from './pdf.js';
 /* ---------- Server ---------- */
 const PORT = Number(process.env.PORT || 3000);
 
-/* ---------- CORS ---------- */
-const allowedList = (process.env.ALLOWED_ORIGIN || '*')
-  .split(',')
-  .map((s) => s.trim())
-  .filter(Boolean);
+/* ---------- CORS with wildcard + logging ---------- */
+type OriginMatcher = { raw: string; test: (ori: string) => boolean };
 
+function buildOriginMatchers(csv: string | undefined): OriginMatcher[] {
+  const parts = (csv || '*')
+    .split(',')
+    .map(s => s.trim())
+    .filter(Boolean);
+
+  return parts.map(p => {
+    if (p === '*') {
+      return { raw: '*', test: () => true };
+    }
+    if (p.includes('*')) {
+      // Turn https://*.onrender.com into /^https:\/\/.*\.onrender\.com$/
+      const rx = new RegExp('^' + p
+        .replace(/[.*+?^${}()|[\]\\]/g, '\\$&')   // escape regex
+        .replace(/\\\*/g, '.*') + '$');
+      return { raw: p, test: (ori: string) => rx.test(ori) };
+    }
+    // Exact match
+    return { raw: p, test: (ori: string) => ori === p };
+  });
+}
+
+const originMatchers = buildOriginMatchers(process.env.ALLOWED_ORIGIN);
 const app = express();
+
+app.use((req, _res, next) => {
+  // Helpful log for CORS debugging (shows exact Origin header)
+  const o = req.headers.origin || '';
+  if (o) console.log('[cors] request origin:', o);
+  next();
+});
+
 app.use(
   cors({
     origin(origin, cb) {
-      if (!origin) return cb(null, true);
-      if (allowedList.includes('*') || allowedList.includes(origin))
-        return cb(null, true);
+      if (!origin) return cb(null, true); // allow curl/local tools
+      const ok = originMatchers.some(m => m.test(origin));
+      if (ok) return cb(null, true);
+      console.warn('[cors] blocked origin:', origin, 'allowed:', originMatchers.map(m => m.raw));
       return cb(new Error('Not allowed by CORS'));
     },
     credentials: false,
@@ -103,24 +130,10 @@ const pendingNarrowByConv = new Map<string, PendingNarrow>();
 
 /* ---------- Helpers ---------- */
 function okPayload(answer: string, history: ChatMessage[]) {
-  return {
-    success: true,
-    answer,
-    reply: answer,
-    message: answer,
-    text: answer,
-    history,
-  };
+  return { success: true, answer, history };
 }
 function errPayload(answer: string, history: ChatMessage[]) {
-  return {
-    success: false,
-    answer,
-    reply: answer,
-    message: answer,
-    text: answer,
-    history,
-  };
+  return { success: false, answer, history };
 }
 function isoFromBody(body: any): string | null {
   const raw = String(body.message ?? body.text ?? body.question ?? '');
@@ -154,8 +167,6 @@ function clampDay(year: number, month: number, day: number) {
 function buildISO(y: number, m: number, d: number) {
   return `${y}-${pad2(m)}-${pad2(clampDay(y, m, d))}`;
 }
-
-/** Get the ISO date for the Nth weekday of a given month (n=1..5). Returns null if that nth doesn't exist. */
 function nthWeekdayISO(year: number, month: number, dow: number, n: 1|2|3|4|5): string | null {
   const dim = getDaysInMonth(new Date(year, month - 1, 1));
   let firstDowDay = -1;
@@ -168,8 +179,6 @@ function nthWeekdayISO(year: number, month: number, dow: number, n: 1|2|3|4|5): 
   if (day > dim) return null;
   return buildISO(year, month, day);
 }
-
-/** Get the ISO date for the LAST weekday of a given month. Always returns a valid date. */
 function lastWeekdayISO(year: number, month: number, dow: number): string {
   const dim = getDaysInMonth(new Date(year, month - 1, 1));
   for (let d = dim; d >= 1; d--) {
@@ -178,27 +187,19 @@ function lastWeekdayISO(year: number, month: number, dow: number): string {
   }
   return buildISO(year, month, dim);
 }
-
-/**
- * Parse many human-friendly date formats into ISO (YYYY-MM-DD).
- * If year or month are missing, use fallbackYear/fallbackMonth (the month currently being discussed).
- */
 function parseHumanDateInMonth(
   text: string,
   fallbackYear?: number,
   fallbackMonth?: number
 ): string | null {
   const t = text.trim().toLowerCase().replace(/\s+/g, ' ');
+  const tryWithFallback = (day: number) =>
+    fallbackYear && fallbackMonth ? buildISO(fallbackYear, fallbackMonth, day) : null;
 
-  const tryWithFallback = (day: number) => {
-    if (fallbackYear && fallbackMonth) return buildISO(fallbackYear, fallbackMonth, day);
-    return null;
-  };
-
-  // A) Vague month phrases with explicit month name (early/mid/late/end of <Month> [Year])
   let m = t.match(/\b(early|mid|late|end(?:\s+of)?)\s+([a-z]{3,9})(?:\s+(\d{4}))?\b/);
   if (m) {
-    const phase = m[1]; const monKey = m[2]; const y = m[3] ? Number(m[3]) : (fallbackYear ?? NaN);
+    const phase = m[1], monKey = m[2];
+    const y = m[3] ? Number(m[3]) : (fallbackYear ?? NaN);
     const mo = MONTH_MAP[monKey];
     if (mo && Number.isFinite(y)) {
       let day = 15;
@@ -209,8 +210,6 @@ function parseHumanDateInMonth(
       return buildISO(y, mo, day);
     }
   }
-
-  // A2) Vague month phrases without explicit month (use fallback month)
   m = t.match(/\b(early|mid(?:-|\s)?month|late|end(?:\s+of)?\s+month|end(?:\s+of)?)\b/);
   if (m && fallbackYear && fallbackMonth) {
     const phrase = m[1];
@@ -221,13 +220,9 @@ function parseHumanDateInMonth(
     else if (/^end/.test(phrase)) day = getDaysInMonth(new Date(fallbackYear, fallbackMonth - 1, 1));
     return buildISO(fallbackYear, fallbackMonth, day);
   }
-
-  // B) "last Friday of Aug(ust) [2026]" or "second Friday of August [2026]" etc.
   m = t.match(/\b(last|first|second|third|fourth|fifth|1st|2nd|3rd|4th|5th)\s+(mon|monday|tue|tues|tuesday|wed|wednesday|thu|thurs|thursday|fri|friday|sat|saturday|sun|sunday)(?:\s+of\s+([a-z]{3,9})(?:\s+(\d{4}))?)?\b/);
   if (m) {
-    const ordRaw = m[1];
-    const wdKey = m[2];
-    const monKey = m[3];
+    const ordRaw = m[1], wdKey = m[2], monKey = m[3];
     const yearOpt = m[4] ? Number(m[4]) : (fallbackYear ?? NaN);
     const dowMap: Record<string, number> = {
       mon:1,monday:1,tue:2,tues:2,tuesday:2,wed:3,wednesday:3,thu:4,thurs:4,thursday:4,fri:5,friday:5,sat:6,saturday:6,sun:0,sunday:0
@@ -236,99 +231,40 @@ function parseHumanDateInMonth(
     const mo = monKey ? MONTH_MAP[monKey] : (fallbackMonth ?? NaN);
     const y = Number.isFinite(yearOpt) ? yearOpt : NaN;
     if (Number.isFinite(dow) && Number.isFinite(mo) && Number.isFinite(y)) {
-      if (/^last$/i.test(ordRaw)) {
-        return lastWeekdayISO(y, mo, dow);
-      } else {
-        const ordMap: Record<string, 1|2|3|4|5> = { first:1, '1st':1, second:2, '2nd':2, third:3, '3rd':3, fourth:4, '4th':4, fifth:5, '5th':5 };
-        const n = ordMap[ordRaw as keyof typeof ordMap];
-        if (n) {
-          const iso = nthWeekdayISO(y, mo, dow, n);
-          return iso ?? lastWeekdayISO(y, mo, dow);
-        }
-      }
+      if (/^last$/i.test(ordRaw)) return lastWeekdayISO(y, mo, dow);
+      const ordMap: Record<string, 1|2|3|4|5> = { first:1,'1st':1,second:2,'2nd':2,third:3,'3rd':3,fourth:4,'4th':4,fifth:5,'5th':5 };
+      const n = ordMap[ordRaw as keyof typeof ordMap];
+      if (n) return nthWeekdayISO(y, mo, dow, n) ?? lastWeekdayISO(y, mo, dow);
     }
   }
-
-  // C) Numeric formats
-  // C1) dd/mm/yyyy or dd-mm-yyyy or dd.mm.yyyy
   m = t.match(/\b(\d{1,2})[\/\-.](\d{1,2})[\/\-.](\d{4})\b/);
-  if (m) {
-    const d = Number(m[1]), mo = Number(m[2]), y = Number(m[3]);
-    if (mo >= 1 && mo <= 12 && d >= 1 && d <= 31) return buildISO(y, mo, d);
-  }
-  // C2) yyyy/mm/dd or yyyy-mm-dd or yyyy.mm.dd
+  if (m) { const d = +m[1], mo = +m[2], y = +m[3]; if (mo>=1&&mo<=12&&d>=1&&d<=31) return buildISO(y,mo,d); }
   m = t.match(/\b(\d{4})[\/\-.](\d{1,2})[\/\-.](\d{1,2})\b/);
-  if (m) {
-    const y = Number(m[1]), mo = Number(m[2]), d = Number(m[3]);
-    if (mo >= 1 && mo <= 12 && d >= 1 && d <= 31) return buildISO(y, mo, d);
-  }
-  // C3) mm/dd/yyyy (US)
-  m = t.match(/\b(\d{1,2})[\/\-.](\d{1,2})[\/\-.](\d{4})\b/);
-  if (m) {
-    const mo = Number(m[1]), d = Number(m[2]), y = Number(m[3]);
-    if (mo >= 1 && mo <= 12 && d >= 1 && d <= 31) return buildISO(y, mo, d);
-  }
-  // C4) dd/mm or dd-mm or dd.mm (use fallback year)
+  if (m) { const y = +m[1], mo = +m[2], d = +m[3]; if (mo>=1&&mo<=12&&d>=1&&d<=31) return buildISO(y,mo,d); }
   m = t.match(/\b(\d{1,2})[\/\-.](\d{1,2})\b/);
-  if (m && fallbackYear) {
-    const d = Number(m[1]), mo = Number(m[2]);
-    if (mo >= 1 && mo <= 12 && d >= 1 && d <= 31) return buildISO(fallbackYear, mo, d);
-  }
-
-  // D) Text month formats
-  // D1) "31 aug 2026" (day month year)
+  if (m && fallbackYear) { const d = +m[1], mo = +m[2]; if (mo>=1&&mo<=12&&d>=1&&d<=31) return buildISO(fallbackYear,mo,d); }
   m = t.match(/\b(\d{1,2})\s+([a-z]{3,9})(?:\s+(\d{4}))?\b/);
-  if (m) {
-    const d = Number(m[1]), monKey = m[2], y = m[3] ? Number(m[3]) : (fallbackYear ?? NaN);
-    const mo = MONTH_MAP[monKey];
-    if (mo && d >= 1 && d <= 31 && Number.isFinite(y)) return buildISO(y, mo, d);
-  }
-  // D2) "aug 31 2026" (month day year)
+  if (m) { const d = +m[1], monKey = m[2], y = m[3]?+m[3]:(fallbackYear??NaN); const mo = MONTH_MAP[monKey]; if (mo&&d>=1&&d<=31&&Number.isFinite(y)) return buildISO(y,mo,d); }
   m = t.match(/\b([a-z]{3,9})\s+(\d{1,2})(?:\s+(\d{4}))?\b/);
-  if (m) {
-    const monKey = m[1], d = Number(m[2]), y = m[3] ? Number(m[3]) : (fallbackYear ?? NaN);
-    const mo = MONTH_MAP[monKey];
-    if (mo && d >= 1 && d <= 31 && Number.isFinite(y)) return buildISO(y, mo, d);
-  }
-  // D3) "2026 aug 31" (year month day)
+  if (m) { const monKey = m[1], d = +m[2], y = m[3]?+m[3]:(fallbackYear??NaN); const mo = MONTH_MAP[monKey]; if (mo&&d>=1&&d<=31&&Number.isFinite(y)) return buildISO(y,mo,d); }
   m = t.match(/\b(\d{4})\s+([a-z]{3,9})\s+(\d{1,2})\b/);
-  if (m) {
-    const y = Number(m[1]), monKey = m[2], d = Number(m[3]);
-    const mo = MONTH_MAP[monKey];
-    if (mo && d >= 1 && d <= 31) return buildISO(y, mo, d);
-  }
-
-  // E) Ordinal day with/without "the": "the 31st" / "31st"
+  if (m) { const y = +m[1], monKey = m[2], d = +m[3]; const mo = MONTH_MAP[monKey]; if (mo&&d>=1&&d<=31) return buildISO(y,mo,d); }
   m = t.match(/\b(?:the\s+)?(\d{1,2})(?:st|nd|rd|th)\b/);
-  if (m) {
-    const d = Number(m[1]);
-    if (d >= 1 && d <= 31) return tryWithFallback(d);
-  }
-
-  // F) Optional weekday + day only, e.g., "mon 31" or just "31"
+  if (m) { const d = +m[1]; if (d>=1&&d<=31) return tryWithFallback(d); }
   if (fallbackYear && fallbackMonth) {
     m = t.match(/\b(?:mon|tue|tues|wed|thu|thurs|fri|sat|sun)?\s*(\d{1,2})\b/);
-    if (m) {
-      const d = Number(m[1]);
-      if (d >= 1 && d <= 31) return buildISO(fallbackYear, fallbackMonth, d);
-    }
+    if (m) { const d = +m[1]; if (d>=1&&d<=31) return buildISO(fallbackYear,fallbackMonth,d); }
   }
-
-  // G) "last friday" / "2nd friday" without month name → resolve with fallbacks if present
   m = t.match(/\b(last|first|second|third|fourth|fifth|1st|2nd|3rd|4th|5th)\s+(mon|monday|tue|tues|tuesday|wed|wednesday|thu|thurs|thursday|fri|friday|sat|saturday|sun|sunday)\b/);
   if (m && fallbackYear && fallbackMonth) {
-    const ordRaw = m[1];
-    const wdKey = m[2];
-    const dowMap: Record<string, number> = {
-      mon:1,monday:1,tue:2,tues:2,tuesday:2,wed:3,wednesday:3,thu:4,thurs:4,thursday:4,fri:5,friday:5,sat:6,saturday:6,sun:0,sunday:0
-    };
+    const ordRaw = m[1], wdKey = m[2];
+    const dowMap: Record<string, number> = { mon:1,monday:1,tue:2,tues:2,tuesday:2,wed:3,wednesday:3,thu:4,thurs:4,thursday:4,fri:5,friday:5,sat:6,saturday:6,sun:0,sunday:0 };
     const dow = dowMap[wdKey];
     if (/^last$/i.test(ordRaw)) return lastWeekdayISO(fallbackYear, fallbackMonth, dow);
-    const ordMap: Record<string, 1|2|3|4|5> = { first:1, '1st':1, second:2, '2nd':2, third:3, '3rd':3, fourth:4, '4th':4, fifth:5, '5th':5 };
+    const ordMap: Record<string, 1|2|3|4|5> = { first:1,'1st':1,second:2,'2nd':2,third:3,'3rd':3,fourth:4,'4th':4,fifth:5,'5th':5 };
     const n = ordMap[ordRaw as keyof typeof ordMap];
     if (n) return nthWeekdayISO(fallbackYear, fallbackMonth, dow, n) ?? lastWeekdayISO(fallbackYear, fallbackMonth, dow);
   }
-
   return null;
 }
 
@@ -530,20 +466,8 @@ async function handleChat(req: express.Request, res: express.Response) {
 
     if (navNext || navPrev) {
       let { year, month } = pending;
-      if (navNext) {
-        month += 1;
-        if (month > 12) {
-          month = 1;
-          year += 1;
-        }
-      }
-      if (navPrev) {
-        month -= 1;
-        if (month < 1) {
-          month = 12;
-          year -= 1;
-        }
-      }
+      if (navNext) { month += 1; if (month > 12) { month = 1; year += 1; } }
+      if (navPrev) { month -= 1; if (month < 1) { month = 12; year -= 1; } }
       pending = { ...pending, year, month };
       pendingNarrowByConv.set(conversationId, pending);
       const phantomIntent = { kind: 'month', year, month, nights: pending.nights } as const;
@@ -565,7 +489,7 @@ async function handleChat(req: express.Request, res: express.Response) {
         addToHistory(conversationId, { role: 'assistant', content: answer });
         return res.json(okPayload(answer, history));
       }
-      const answer = `✅ Available from ${formatDate(explicitDate)} for ${nights} night(s). Estimated total: GBP ${q.total.toFixed(2)}. You can book on our [availability page](https://www.hanselcottage.com/availability).`;
+      const answer = `✅ Available from ${formatDate(explicitDate)} for ${nights} night(s). Estimated total: GBP ${q.total.toFixed(2)}. You can [book here](https://www.hanselcottage.com/availability).`;
       addToHistory(conversationId, { role: 'assistant', content: answer });
       pendingNarrowByConv.delete(conversationId);
       return res.json(okPayload(answer, history));
@@ -592,7 +516,7 @@ async function handleChat(req: express.Request, res: express.Response) {
       }
 
       const lines = narrowed.map((v) => `• ${formatDate(v.from)} (${nights} nights) — £${v.price.toFixed(2)}`).join('\n');
-      const answer = `Here are the options I found:\n${lines}\n\nYou can book on our [availability page](https://www.hanselcottage.com/availability).`;
+      const answer = `Here are the options I found:\n${lines}\n\nYou can [book here](https://www.hanselcottage.com/availability).`;
       addToHistory(conversationId, { role: 'assistant', content: answer });
       return res.json(okPayload(answer, history));
     }
@@ -621,7 +545,7 @@ async function handleChat(req: express.Request, res: express.Response) {
           return res.json(okPayload(answer, history));
         }
         const lines = priced.map((v) => `• ${formatDate(v.from)} — £${v.price.toFixed(2)}`).join('\n');
-        const answer = `❌ Sorry, those dates look unavailable. Here are some priceable alternatives:\n${lines}\n\nYou can book on our [availability page](https://www.hanselcottage.com/availability).`;
+        const answer = `❌ Sorry, those dates look unavailable. Here are some priceable alternatives:\n${lines}\n\nYou can [book here](https://www.hanselcottage.com/availability).`;
         addToHistory(conversationId, { role: 'assistant', content: answer });
         return res.json(okPayload(answer, history));
       }
@@ -633,7 +557,7 @@ async function handleChat(req: express.Request, res: express.Response) {
         return res.json(okPayload(answer, history));
       }
 
-      const answer = `✅ Available from ${formatDate(from)} for ${nights} night(s). Estimated total: GBP ${q.total.toFixed(2)}. You can book on our [availability page](https://www.hanselcottage.com/availability).`;
+      const answer = `✅ Available from ${formatDate(from)} for ${nights} night(s). Estimated total: GBP ${q.total.toFixed(2)}. You can [book here](https://www.hanselcottage.com/availability).`;
       addToHistory(conversationId, { role: 'assistant', content: answer });
       return res.json(okPayload(answer, history));
     }
@@ -655,7 +579,7 @@ async function handleChat(req: express.Request, res: express.Response) {
   }
 }
 
-/* ---------- Month flow: returns ALL priceable starts ---------- */
+/* ---------- Month flow ---------- */
 async function runMonthFlow(
   intent: { kind: 'month'; year: number; month: number; nights: number },
   conversationId: string,
@@ -691,7 +615,7 @@ async function runMonthFlow(
   const answer = `Here are all priceable start dates in ${year}-${String(month).padStart(
     2,
     '0'
-  )} for ${nights} night(s):\n${lines}\n\nYou can book on our [availability page](https://www.hanselcottage.com/availability).`;
+  )} for ${nights} night(s):\n${lines}\n\nYou can [book here](https://www.hanselcottage.com/availability).`;
 
   addToHistory(conversationId, { role: 'assistant', content: answer });
   return res.json(okPayload(answer, history));
@@ -717,6 +641,7 @@ app.listen(PORT, async () => {
     console.warn('[rag] init error', e?.message || e);
   }
 
+  const publicDir = path.resolve(process.cwd(), 'public');
   const raw = (process.env.PDF_URLS || '')
     .split(',')
     .map((s) => s.trim())
